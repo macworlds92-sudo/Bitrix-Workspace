@@ -1,15 +1,66 @@
-import { useState, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 
-const API_URL = "/api/claude";
-const MODEL = "claude-sonnet-4-20250514";
-const BITRIX_MCP = { type: "url", url: "https://mcp.bitrix24.com/mcp", name: "bitrix24" };
-const HOURS = Array.from({ length: 11 }, (_, i) => i + 9);
-const AVG_CYCLE = 18;
+// ── Bitrix24 connection from URL params ───────────────────────────────────────
+const getB24 = () => {
+  const p = new URLSearchParams(window.location.search);
+  return { domain: p.get("DOMAIN") || "", sid: p.get("APP_SID") || "" };
+};
 
-const today = new Date();
-const todayStr = today.toLocaleDateString("ru-RU");
-const toMins = (t = "00:00") => { const [h, m] = t.split(":"); return +h * 60 + (+m || 0); };
+const b24 = async (domain, sid, method, params = {}) => {
+  if (!domain || !sid) throw new Error("Нет подключения к Bitrix24. Откройте приложение из Bitrix24.");
+  const url = new URL(`https://${domain}/rest/${method}.json`);
+  url.searchParams.set("auth", sid);
+  const flatten = (obj, prefix = "") =>
+    Object.entries(obj).forEach(([k, v]) => {
+      const key = prefix ? `${prefix}[${k}]` : k;
+      if (Array.isArray(v)) v.forEach((x, i) => url.searchParams.set(`${key}[${i}]`, x));
+      else if (v && typeof v === "object") flatten(v, key);
+      else if (v !== undefined && v !== null) url.searchParams.set(key, v);
+    });
+  flatten(params);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`Bitrix24 HTTP ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error_description || data.error);
+  return data.result;
+};
 
+const claudeCall = async (userMsg, systemMsg) => {
+  const res = await fetch("/api/claude", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514", max_tokens: 1000,
+      system: systemMsg,
+      messages: [{ role: "user", content: userMsg }]
+    })
+  });
+  if (!res.ok) throw new Error(`Claude API ${res.status}`);
+  const data = await res.json();
+  return (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+};
+
+const parseJSON = (text) => {
+  try {
+    const s = text.indexOf("{"), e = text.lastIndexOf("}");
+    return s >= 0 ? JSON.parse(text.slice(s, e + 1)) : null;
+  } catch { return null; }
+};
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+const todayStr = new Date().toLocaleDateString("ru-RU");
+const tomorrowDate = () => { const d = new Date(); d.setDate(d.getDate() + 1); return d; };
+const tomorrowISO = () => tomorrowDate().toISOString();
+const tomorrowStr = tomorrowDate().toLocaleDateString("ru-RU");
+const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString("ru-RU") : null;
+const isToday = (dl) => dl === todayStr;
+const isOverdue = (dl) => {
+  if (!dl) return false;
+  const [d, m, y] = dl.split(".");
+  return new Date(y, m - 1, d) < new Date(new Date().toDateString());
+};
+const isFuture = (dl) => !dl || (!isToday(dl) && !isOverdue(dl));
+
+// ── Colors ────────────────────────────────────────────────────────────────────
 const C = {
   purple: { bg: "#EEEDFE", text: "#3C3489", border: "#AFA9EC" },
   teal:   { bg: "#E1F5EE", text: "#0F6E56", border: "#5DCAA5" },
@@ -22,97 +73,31 @@ const C = {
 };
 
 const TAG_PRESETS = [
-  { id: "hot",      label: "Горячий",          color: "#A32D2D", bg: "#FCEBEB" },
-  { id: "kp_wait",  label: "Ждёт КП",          color: "#854F0B", bg: "#FAEEDA" },
-  { id: "negotiat", label: "Переговоры",        color: "#185FA5", bg: "#E6F1FB" },
-  { id: "contract", label: "Готов к договору",  color: "#3B6D11", bg: "#EAF3DE" },
-  { id: "slow",     label: "Долго думает",      color: "#5F5E5A", bg: "#F1EFE8" },
-  { id: "vip",      label: "VIP",               color: "#534AB7", bg: "#EEEDFE" },
+  { id: "hot",      label: "Горячий",         color: "#A32D2D", bg: "#FCEBEB" },
+  { id: "kp_wait",  label: "Ждёт КП",         color: "#854F0B", bg: "#FAEEDA" },
+  { id: "negotiat", label: "Переговоры",       color: "#185FA5", bg: "#E6F1FB" },
+  { id: "contract", label: "Готов к договору", color: "#3B6D11", bg: "#EAF3DE" },
+  { id: "slow",     label: "Долго думает",     color: "#5F5E5A", bg: "#F1EFE8" },
+  { id: "vip",      label: "VIP",              color: "#534AB7", bg: "#EEEDFE" },
 ];
-
-const STAGES = {
-  NEW:          { label: "Новая",           color: "blue" },
-  PREPARATION:  { label: "Подготовка",      color: "purple" },
-  KP_SENT:      { label: "КП отправлено",   color: "amber" },
-  NEGOTIATION:  { label: "Переговоры",      color: "teal" },
-  CONTRACT:     { label: "Договор",         color: "green" },
-  WON:          { label: "Выиграна",        color: "green" },
-  LOSE:         { label: "Проиграна",       color: "red" },
-};
-
-const FILE_COLOR = { kp: "blue", tz: "purple", contract: "green", photo: "teal", other: "gray" };
-const FILE_LABEL = { kp: "КП", tz: "ТЗ", contract: "Договор", photo: "Фото", other: "Файл" };
 
 const RESULT_OPTS = [
-  { id: "done",      label: "Выполнено",    color: "green"  },
-  { id: "callback",  label: "Перезвонит",   color: "blue"   },
-  { id: "no_answer", label: "Не ответил",   color: "amber"  },
-  { id: "refuse",    label: "Отказ",        color: "red"    },
+  { id: "done",      label: "Выполнено",  color: "green" },
+  { id: "callback",  label: "Перезвонит", color: "blue"  },
+  { id: "no_answer", label: "Не ответил", color: "amber" },
+  { id: "refuse",    label: "Отказ",      color: "red"   },
 ];
 
-// ── Demo data ────────────────────────────────────────────────────────────────
-const DEMO_SCHEDULE = [
-  { id:1, type:"call", timeStart:"09:00", timeEnd:"10:00",
-    dealId:"73668", dealTitle:"ООО Альфастрой — остекление лоджий",
-    action:"узнать как КП", priority:"high", stage:"KP_SENT",
-    amount:285000, daysInCycle:14,
-    lastTouch:"23.05 — Отправили КП на 285 000 ₽. Клиент попросил подумать до пятницы. Контакт: Олег, доброжелательный.",
-    contact:{ name:"Семёнов О.В.", phone:"+7 (916) 234-56-78" },
-    files:[{ name:"КП_Альфастрой_v2.pdf", type:"kp" },{ name:"ТЗ_лоджии.docx", type:"tz" }],
-    tags:["hot"], status:"pending", blocksSlot:false, comment:"" },
+const STAGE_MAP = {
+  "NEW":           { label: "Новая",         color: "blue"   },
+  "PREPARATION":   { label: "Подготовка",    color: "purple" },
+  "EXECUTING":     { label: "В работе",      color: "amber"  },
+  "FINAL_INVOICE": { label: "Счёт",          color: "teal"   },
+  "WON":           { label: "Выиграна",      color: "green"  },
+  "LOSE":          { label: "Проиграна",     color: "red"    },
+};
 
-  { id:2, type:"call", timeStart:"11:00", timeEnd:"12:00",
-    dealId:"73480", dealTitle:"ИП Кузнецов — балкон под ключ",
-    action:"узнать как КП", priority:"medium", stage:"KP_SENT",
-    amount:142000, daysInCycle:7,
-    lastTouch:"24.05 — Первый контакт. КП отправлено. Торгуется по цене.",
-    contact:{ name:"Кузнецов П.А.", phone:"+7 (903) 345-67-89" },
-    files:[{ name:"КП_Кузнецов.pdf", type:"kp" }],
-    tags:["kp_wait"], status:"pending", blocksSlot:false, comment:"" },
-
-  { id:3, type:"meeting", timeStart:"13:00", timeEnd:"15:00",
-    dealId:"72886", dealTitle:"ООО Горизонт — офис 18 окон",
-    action:"встреча в офисе клиента", priority:"high", stage:"NEGOTIATION",
-    amount:890000, daysInCycle:22,
-    lastTouch:"22.05 — Встреча перенесена клиентом. Договорились 28.05 в 13:00. Готовы к договору, обсуждаем рассрочку.",
-    contact:{ name:"Николаева И.С.", phone:"+7 (925) 456-78-90" },
-    files:[{ name:"КП_Горизонт_final.pdf", type:"kp" },{ name:"Договор_проект.docx", type:"contract" },{ name:"ТЗ_офис.pdf", type:"tz" }],
-    tags:["contract","vip"], status:"pending", blocksSlot:true, comment:"" },
-
-  { id:4, type:"call", timeStart:"15:00", timeEnd:"16:00",
-    dealId:"70358", dealTitle:"Петров А.Н. — частный дом",
-    action:"ОС по КП", priority:"high", stage:"KP_SENT",
-    amount:520000, daysInCycle:19,
-    lastTouch:"20.05 — Повторно отправили КП со скидкой 5%. Обещал ответить в течение недели.",
-    contact:{ name:"Петров А.Н.", phone:"+7 (977) 567-89-01" },
-    files:[{ name:"КП_Петров_v3.pdf", type:"kp" }],
-    tags:["negotiat"], status:"pending", blocksSlot:false, comment:"" },
-
-  { id:5, type:"call", timeStart:"17:00", timeEnd:"18:00",
-    dealId:"71304", dealTitle:"ООО СтройПрофи — склад",
-    action:"узнать как дела", priority:"low", stage:"PREPARATION",
-    amount:0, daysInCycle:5,
-    lastTouch:"24.05 — Первый контакт. Замер назначен на 30.05.",
-    contact:{ name:"Ткачёв В.В.", phone:"+7 (906) 678-90-12" },
-    files:[],
-    tags:[], status:"pending", blocksSlot:false, comment:"" },
-];
-
-const DEMO_QUEUE = [
-  { id:101, type:"task", dealId:"74100", dealTitle:"Иванова Е. — студия",
-    action:"уточнить размеры и отправить КП", priority:"medium", stage:"NEW",
-    amount:78000, daysInCycle:2,
-    lastTouch:"27.05 — Входящая заявка. Замер не проводили.",
-    contact:{ name:"Иванова Е.М.", phone:"+7 (911) 789-01-23" },
-    files:[], tags:[], status:"pending", blocksSlot:false, comment:"" },
-
-  { id:102, type:"task", dealId:"73990", dealTitle:"ООО ТехноПарк — 4 этажа",
-    action:"готовы на замер?", priority:"high", stage:"NEW",
-    amount:0, daysInCycle:3,
-    lastTouch:"26.05 — Лид с сайта. Не дозвонились вчера.",
-    contact:{ name:"Логинов Д.С.", phone:"+7 (926) 890-12-34" },
-    files:[], tags:["hot"], status:"pending", blocksSlot:false, comment:"" },
-];
+const TASK_STATUS = { 1:"Новая", 2:"Ждёт", 3:"В работе", 5:"Завершена", 6:"Отложена" };
 
 // ── UI primitives ─────────────────────────────────────────────────────────────
 function Badge({ color = "gray", children, sm }) {
@@ -121,316 +106,251 @@ function Badge({ color = "gray", children, sm }) {
 }
 
 function Spin({ label = "Загрузка…" }) {
-  return <span style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-text-secondary)", fontSize: 12 }}>
-    <svg width="13" height="13" viewBox="0 0 13 13" style={{ animation: "spin 1s linear infinite", flexShrink: 0 }}>
+  return <span style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-text-secondary)", fontSize: 13 }}>
+    <svg width="14" height="14" viewBox="0 0 14 14" style={{ animation: "spin 1s linear infinite", flexShrink: 0 }}>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-      <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="20 8" />
+      <circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="20 8" />
     </svg>{label}
   </span>;
 }
 
+function StatCard({ label, value, color = "gray", note }) {
+  return <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "10px 14px", flex: 1, minWidth: 80 }}>
+    <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-secondary)" }}>{label}</p>
+    <p style={{ margin: 0, fontSize: 20, fontWeight: 500, color: C[color].text }}>{value}</p>
+    {note && <p style={{ margin: 0, fontSize: 9, color: "var(--color-text-tertiary)", marginTop: 2 }}>{note}</p>}
+  </div>;
+}
+
 // ── Mini time grid ─────────────────────────────────────────────────────────────
-function MiniGrid({ tasks }) {
+function MiniGrid({ events }) {
+  const HOURS = Array.from({ length: 11 }, (_, i) => i + 9);
+  const toMins = (t = "00:00") => { const [h, m] = t.split(":"); return +h * 60 + (+m || 0); };
   return (
     <div style={{ marginBottom: 14 }}>
       <p style={{ margin: "0 0 5px", fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.07em" }}>Расписание {todayStr}</p>
       <div style={{ display: "flex", gap: 2 }}>
         {HOURS.map(h => {
-          const meeting = tasks.find(t => t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
-          const call = !meeting && tasks.find(t => !t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
-          const done = !meeting && !call && tasks.find(t => t.status === "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
-          const bg = meeting ? C.purple.bg : call ? C.blue.bg : done ? C.green.bg : "var(--color-background-secondary)";
-          const bc = meeting ? C.purple.border : call ? C.blue.border : done ? C.green.border : "var(--color-border-tertiary)";
-          const tc = meeting ? C.purple.text : call ? C.blue.text : done ? C.green.text : "var(--color-text-tertiary)";
+          const ev = events.find(e => toMins(e.timeStart) <= h * 60 && toMins(e.timeEnd) > h * 60);
+          const bg = ev ? (ev.type === "meeting" ? C.purple.bg : C.blue.bg) : "var(--color-background-secondary)";
+          const bc = ev ? (ev.type === "meeting" ? C.purple.border : C.blue.border) : "var(--color-border-tertiary)";
           return (
             <div key={h} style={{ flex: 1, textAlign: "center" }}>
               <div style={{ height: 18, background: bg, border: `0.5px solid ${bc}`, borderRadius: 3, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                {meeting && <i className="ti ti-users" style={{ fontSize: 8, color: C.purple.text }} aria-hidden="true" />}
-                {call && <i className="ti ti-phone" style={{ fontSize: 8, color: C.blue.text }} aria-hidden="true" />}
-                {done && <i className="ti ti-check" style={{ fontSize: 8, color: C.green.text }} aria-hidden="true" />}
+                {ev && <span style={{ fontSize: 8, color: ev.type === "meeting" ? C.purple.text : C.blue.text }}>{ev.type === "meeting" ? "●" : "○"}</span>}
               </div>
-              <span style={{ fontSize: 8, color: tc }}>{h}</span>
+              <span style={{ fontSize: 8, color: "var(--color-text-tertiary)" }}>{h}</span>
             </div>
           );
         })}
       </div>
-      <div style={{ display: "flex", gap: 10, marginTop: 5, fontSize: 9, color: "var(--color-text-tertiary)" }}>
-        {[["Встреча (блок)", C.purple], ["Звонок", C.blue], ["Выполнено", C.green]].map(([l, c]) => (
-          <span key={l} style={{ display: "flex", alignItems: "center", gap: 3 }}>
-            <span style={{ width: 7, height: 7, borderRadius: 2, background: c.bg, border: `0.5px solid ${c.border}`, display: "inline-block" }} />{l}
-          </span>
-        ))}
-      </div>
     </div>
   );
 }
 
-// ── Deal preview (expanded) ───────────────────────────────────────────────────
-function DealPreview({ task }) {
-  const si = STAGES[task.stage] || { label: task.stage || "—", color: "gray" };
-  const cc = task.daysInCycle < AVG_CYCLE * 0.6 ? "green" : task.daysInCycle < AVG_CYCLE ? "amber" : "red";
-  const cyclePct = Math.min(100, Math.round(task.daysInCycle / (AVG_CYCLE * 1.5) * 100));
-
+// ── Deal preview ──────────────────────────────────────────────────────────────
+function DealPreview({ deal }) {
+  const si = STAGE_MAP[deal.STAGE_ID] || { label: deal.STAGE_ID || "—", color: "gray" };
+  const days = Math.round((Date.now() - new Date(deal.DATE_CREATE)) / 86400000);
   return (
     <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 10, marginTop: 8 }}>
-
-      {/* Stats row */}
-      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
         <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", minWidth: 80 }}>
           <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Сумма</p>
-          <p style={{ margin: 0, fontSize: 13, fontWeight: 500, color: task.amount > 0 ? C.teal.text : "var(--color-text-tertiary)" }}>
-            {task.amount > 0 ? Number(task.amount).toLocaleString("ru") + " ₽" : "Не указана"}
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 500, color: C.teal.text }}>
+            {deal.OPPORTUNITY > 0 ? Number(deal.OPPORTUNITY).toLocaleString("ru") + " " + (deal.CURRENCY_ID || "₽") : "—"}
           </p>
         </div>
         <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", minWidth: 80 }}>
-          <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Цикл сделки</p>
-          <p style={{ margin: 0, fontSize: 13, fontWeight: 500, color: C[cc].text }}>{task.daysInCycle} дн.</p>
-          <div style={{ height: 3, background: "var(--color-border-tertiary)", borderRadius: 2, marginTop: 3 }}>
-            <div style={{ height: "100%", width: `${cyclePct}%`, background: C[cc].border, borderRadius: 2 }} />
-          </div>
+          <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Цикл</p>
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 500, color: C[days > 21 ? "red" : days > 14 ? "amber" : "green"].text }}>{days} дн.</p>
         </div>
-        <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", flex: 1, minWidth: 100 }}>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", flex: 1 }}>
           <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Стадия</p>
           <div style={{ marginTop: 3 }}><Badge color={si.color} sm>{si.label}</Badge></div>
         </div>
       </div>
-
-      {/* Last touch */}
-      {task.lastTouch && (
+      {deal.COMMENTS && (
         <div style={{ background: C.amber.bg, border: `0.5px solid ${C.amber.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 8 }}>
-          <p style={{ margin: "0 0 2px", fontSize: 9, color: C.amber.text, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 }}>Последнее касание</p>
-          <p style={{ margin: 0, fontSize: 12, color: C.amber.text }}>{task.lastTouch}</p>
+          <p style={{ margin: "0 0 2px", fontSize: 9, color: C.amber.text, textTransform: "uppercase", fontWeight: 500 }}>Последнее касание</p>
+          <p style={{ margin: 0, fontSize: 12, color: C.amber.text }}>{deal.COMMENTS}</p>
         </div>
       )}
-
-      {/* Files */}
-      {task.files?.length > 0 && (
-        <div style={{ marginBottom: 8 }}>
-          <p style={{ margin: "0 0 4px", fontSize: 9, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Файлы</p>
-          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-            {task.files.map((f, i) => (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 6, padding: "2px 8px" }}>
-                <Badge color={FILE_COLOR[f.type] || "gray"} sm>{FILE_LABEL[f.type] || "Файл"}</Badge>
-                <span style={{ fontSize: 11, color: "var(--color-text-primary)" }}>{f.name}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Contact actions */}
-      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-        <div style={{ flex: 1 }}>
-          <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{task.contact.name}</p>
-          <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{task.contact.phone}</p>
-        </div>
-        <a href={`tel:${task.contact.phone}`} style={{ textDecoration: "none" }}>
-          <button style={{ fontSize: 11, padding: "4px 10px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Позвонить">
-            <i className="ti ti-phone" style={{ fontSize: 11 }} aria-hidden="true" /> Позвонить
-          </button>
-        </a>
-        <button style={{ fontSize: 11, padding: "4px 10px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Открытая линия">
-          <i className="ti ti-message" style={{ fontSize: 11 }} aria-hidden="true" /> Написать
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ── Inline tag picker ─────────────────────────────────────────────────────────
-function TagRow({ selected, onChange }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div>
-      <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
-        {selected.map(tid => {
-          const t = TAG_PRESETS.find(x => x.id === tid);
-          return t ? <span key={tid} onClick={() => onChange(selected.filter(x => x !== tid))} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 4, padding: "1px 7px", fontSize: 10, fontWeight: 500, cursor: "pointer" }} title="Убрать тег">{t.label} ×</span> : null;
-        })}
-        <button onClick={() => setOpen(o => !o)} style={{ fontSize: 10, padding: "2px 8px" }} aria-label="Управление тегами">
-          <i className="ti ti-tag" style={{ fontSize: 10 }} aria-hidden="true" /> {open ? "Закрыть" : "Теги"}
-        </button>
-      </div>
-      {open && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 5, padding: "6px 8px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-tertiary)" }}>
-          {TAG_PRESETS.map(tag => {
-            const active = selected.includes(tag.id);
-            return <span key={tag.id} onClick={() => { onChange(active ? selected.filter(x => x !== tag.id) : [...selected, tag.id]); }} style={{ background: active ? tag.bg : "transparent", color: active ? tag.color : "var(--color-text-secondary)", border: `0.5px solid ${active ? tag.color : "var(--color-border-tertiary)"}`, borderRadius: 4, padding: "2px 8px", fontSize: 10, cursor: "pointer", fontWeight: active ? 500 : 400 }}>{tag.label}</span>;
-          })}
+      {days > 14 && (
+        <div style={{ background: C.red.bg, border: `0.5px solid ${C.red.border}`, borderRadius: "var(--border-radius-md)", padding: "6px 10px", marginBottom: 8 }}>
+          <p style={{ margin: 0, fontSize: 11, color: C.red.text }}>⚠ {days} дней без закрытия — сделка застряла</p>
         </div>
       )}
     </div>
   );
 }
 
-// ── Reschedule form ───────────────────────────────────────────────────────────
-function RescheduleForm({ task, allTasks, onSave, onCancel }) {
-  const [date, setDate] = useState("");
-  const [time, setTime] = useState("");
-  const [comment, setComment] = useState("");
-
-  const slotBlocked = time && allTasks.some(t => t.id !== task.id && t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= toMins(time) && toMins(t.timeEnd) > toMins(time));
-  const valid = comment.trim().length >= 5 && date && !slotBlocked;
-
+// ── Quick result buttons ───────────────────────────────────────────────────────
+function QuickActions({ task, onDone, onCallback, onNoAnswer, onExpand, busy }) {
   return (
-    <div style={{ marginTop: 8, padding: 10, background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-tertiary)" }}>
-      <p style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 500 }}>Перенести дело</p>
-      <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-        <div style={{ flex: 1 }}>
-          <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>Новая дата <span style={{ color: "var(--color-text-danger)" }}>*</span></label>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: "100%", fontSize: 12, padding: "5px 8px", boxSizing: "border-box" }} />
-        </div>
-        {!task.blocksSlot && (
-          <div style={{ flex: 1 }}>
-            <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>Время</label>
-            <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ width: "100%", fontSize: 12, padding: "5px 8px", boxSizing: "border-box" }} />
-          </div>
-        )}
-      </div>
-      {slotBlocked && <p style={{ margin: "0 0 6px", fontSize: 11, color: C.red.text }}>⚠ Это время занято встречей — выберите другое</p>}
-      <div style={{ marginBottom: 6 }}>
-        <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>
-          Результат касания + причина переноса <span style={{ color: "var(--color-text-danger)" }}>*</span>
-        </label>
-        <textarea value={comment} onChange={e => setComment(e.target.value)} placeholder="Обязательно: что произошло? О чём говорили? Почему переносим?" style={{ width: "100%", minHeight: 55, fontSize: 12, padding: 7, boxSizing: "border-box", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical" }} />
-        {comment.trim().length > 0 && comment.trim().length < 5 && <p style={{ margin: "2px 0 0", fontSize: 10, color: "var(--color-text-secondary)" }}>Слишком коротко</p>}
-      </div>
-      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-        <button onClick={onCancel} style={{ fontSize: 11, padding: "4px 12px" }}>Отмена</button>
-        <button onClick={() => valid && onSave({ date, time, comment })} disabled={!valid} style={{ fontSize: 11, padding: "4px 12px" }} aria-label="Сохранить перенос">Перенести ↗</button>
-      </div>
-    </div>
-  );
-}
-
-// ── Complete form ─────────────────────────────────────────────────────────────
-function CompleteForm({ onSave, onCancel }) {
-  const [result, setResult] = useState("done");
-  const [comment, setComment] = useState("");
-  const valid = comment.trim().length >= 5;
-
-  return (
-    <div style={{ marginTop: 8, padding: 10, background: C.green.bg, borderRadius: "var(--border-radius-md)", border: `0.5px solid ${C.green.border}` }}>
-      <p style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 500, color: C.green.text }}>Результат</p>
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
-        {RESULT_OPTS.map(r => (
-          <button key={r.id} onClick={() => setResult(r.id)} style={{ fontSize: 11, padding: "3px 10px", background: result === r.id ? C[r.color].bg : "transparent", border: result === r.id ? `1.5px solid ${C[r.color].border}` : "0.5px solid var(--color-border-secondary)", borderRadius: 6, cursor: "pointer", color: result === r.id ? C[r.color].text : "var(--color-text-secondary)", fontWeight: result === r.id ? 500 : 400 }}>{r.label}</button>
-        ))}
-      </div>
-      <textarea value={comment} onChange={e => setComment(e.target.value)} placeholder="Что обсудили? О чём договорились? Следующий шаг?" style={{ width: "100%", minHeight: 50, fontSize: 12, padding: 7, boxSizing: "border-box", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical", marginBottom: 6 }} />
-      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-        <button onClick={onCancel} style={{ fontSize: 11, padding: "4px 12px" }}>Отмена</button>
-        <button onClick={() => valid && onSave({ result, comment })} disabled={!valid} style={{ fontSize: 11, padding: "4px 12px" }} aria-label="Сохранить результат">Сохранить ↗</button>
-      </div>
+    <div style={{ display: "flex", gap: 4, padding: "4px 11px 8px", borderTop: "0.5px solid var(--color-border-tertiary)", marginTop: 4 }}>
+      <button onClick={() => onDone(task.id)} disabled={busy} style={{ fontSize: 10, padding: "3px 8px", background: C.green.bg, color: C.green.text, border: `0.5px solid ${C.green.border}`, borderRadius: 5, cursor: "pointer", fontWeight: 500 }}>✓ Готово</button>
+      <button onClick={() => onCallback(task.id)} disabled={busy} style={{ fontSize: 10, padding: "3px 8px", background: C.blue.bg, color: C.blue.text, border: `0.5px solid ${C.blue.border}`, borderRadius: 5, cursor: "pointer", fontWeight: 500 }}>↻ Перезвонит</button>
+      <button onClick={() => onNoAnswer(task.id)} disabled={busy} style={{ fontSize: 10, padding: "3px 8px", background: C.amber.bg, color: C.amber.text, border: `0.5px solid ${C.amber.border}`, borderRadius: 5, cursor: "pointer", fontWeight: 500 }}>— Не ответил</button>
+      <button onClick={onExpand} style={{ fontSize: 10, padding: "3px 8px", marginLeft: "auto", color: "var(--color-text-tertiary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 5, cursor: "pointer" }}>··· Подробнее</button>
     </div>
   );
 }
 
 // ── Task card ─────────────────────────────────────────────────────────────────
-function TaskCard({ task, allTasks, onUpdate, onComplete, onReschedule, isQueue }) {
+function TaskCard({ task, allTasks, deals, onQuickDone, onQuickCallback, onQuickNoAnswer, onComplete, onReschedule, onUpdateTags, busy, statusChanging }) {
   const [expanded, setExpanded] = useState(false);
-  const [mode, setMode] = useState(null); // null | "complete" | "reschedule"
+  const [mode, setMode] = useState(null);
+  const [comment, setComment] = useState("");
+  const [result, setResult] = useState("done");
+  const [date, setDate] = useState("");
+  const [hint, setHint] = useState("");
+  const [loadingHint, setLoadingHint] = useState(false);
+
   const done = task.status === "done";
-  const rescheduled = task.status === "rescheduled";
+  const overdue = isOverdue(task.deadline);
+  const deal = deals.find(d => String(d.ID) === String(task.dealId));
 
-  const border = done
-    ? "var(--color-border-tertiary)"
-    : task.blocksSlot
-    ? C.purple.border
-    : task.priority === "high"
-    ? C.coral.border
-    : "var(--color-border-tertiary)";
+  const border = done ? "var(--color-border-tertiary)" : overdue ? C.red.border : task.priority === "high" ? C.coral.border : "var(--color-border-tertiary)";
+  const bg = done ? "var(--color-background-secondary)" : "var(--color-background-primary)";
 
-  const bg = done
-    ? "var(--color-background-secondary)"
-    : task.blocksSlot
-    ? C.purple.bg
-    : "var(--color-background-primary)";
+  const slotBlocked = date && allTasks.some(t =>
+    t.id !== task.id && t.type === "meeting" && t.status !== "done" && t.timeStart &&
+    Math.abs(new Date(date) - new Date()) < 86400000
+  );
 
-  const toggle = () => { if (mode) return; setExpanded(e => !e); };
-  const setModeAndExpand = (m) => { setMode(m); setExpanded(true); };
+  const loadHint = async () => {
+    if (hint || !deal) return;
+    setLoadingHint(true);
+    try {
+      const text = await claudeCall(
+        `Сделка: ${deal.TITLE}, стадия: ${deal.STAGE_ID}, сумма: ${deal.OPPORTUNITY} ${deal.CURRENCY_ID}, последнее касание: ${deal.COMMENTS || "нет данных"}, цель звонка: ${task.title}. Дай одну конкретную фразу-открытие для звонка (1-2 предложения, без воды).`,
+        "Ты эксперт по продажам. Дай только фразу, без предисловий."
+      );
+      setHint(text.trim());
+    } catch { setHint(""); }
+    setLoadingHint(false);
+  };
+
+  const handleExpand = () => {
+    if (!expanded) loadHint();
+    setExpanded(e => !e);
+    setMode(null);
+  };
+
+  const saveComplete = () => {
+    if (comment.trim().length < 3) return;
+    onComplete(task.id, { result, comment });
+    setMode(null); setExpanded(false); setComment(""); 
+  };
+
+  const saveReschedule = () => {
+    if (!date || comment.trim().length < 3 || slotBlocked) return;
+    onReschedule(task.id, { date, comment });
+    setMode(null); setExpanded(false); setComment(""); setDate("");
+  };
 
   return (
-    <div style={{ border: `0.5px solid ${border}`, background: bg, borderRadius: "var(--border-radius-lg)", marginBottom: 5, overflow: "hidden" }}>
-
-      {/* Row */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 11px", cursor: "pointer" }} onClick={toggle}>
-
-        {/* Time OR type icon */}
-        {!isQueue ? (
-          <div style={{ flexShrink: 0, textAlign: "center", minWidth: 50 }}>
-            <p style={{ margin: 0, fontSize: 12, fontWeight: 500, color: done ? "var(--color-text-tertiary)" : task.blocksSlot ? C.purple.text : C.blue.text, lineHeight: 1.2 }}>{task.timeStart}</p>
-            <p style={{ margin: 0, fontSize: 9, color: "var(--color-text-tertiary)" }}>— {task.timeEnd}</p>
-          </div>
-        ) : (
-          <div style={{ flexShrink: 0, width: 26, height: 26, borderRadius: "50%", background: C.blue.bg, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <i className={`ti ${task.type === "call" ? "ti-phone" : task.type === "meeting" ? "ti-users" : "ti-check"}`} style={{ fontSize: 11, color: C.blue.text }} aria-hidden="true" />
+    <div style={{ border: `0.5px solid ${border}`, background: bg, borderRadius: "var(--border-radius-lg)", marginBottom: 6, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 11px", cursor: "pointer" }} onClick={handleExpand}>
+        {task.timeStart && (
+          <div style={{ flexShrink: 0, textAlign: "center", minWidth: 46 }}>
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 500, color: done ? "var(--color-text-tertiary)" : task.type === "meeting" ? C.purple.text : C.blue.text, lineHeight: 1.2 }}>{task.timeStart}</p>
+            {task.timeEnd && <p style={{ margin: 0, fontSize: 9, color: "var(--color-text-tertiary)" }}>— {task.timeEnd}</p>}
           </div>
         )}
-
-        {/* Content */}
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 2, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 12, fontWeight: 500, color: done ? "var(--color-text-tertiary)" : "var(--color-text-primary)", textDecoration: done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>{task.dealTitle}</span>
-            {task.blocksSlot && <Badge color="purple" sm>встреча ⛔</Badge>}
-            {task.priority === "high" && !done && <Badge color="coral" sm>срочно</Badge>}
+        {!task.timeStart && (
+          <div style={{ width: 24, height: 24, borderRadius: "50%", background: task.type === "meeting" ? C.purple.bg : C.blue.bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <span style={{ fontSize: 10, color: task.type === "meeting" ? C.purple.text : C.blue.text }}>{task.type === "meeting" ? "●" : "○"}</span>
           </div>
-          <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
-            <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>#{task.dealId}</span>
-            <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>→ {task.action}</span>
-            {task.tags.map(tid => { const t = TAG_PRESETS.find(x => x.id === tid); return t ? <span key={tid} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 3, padding: "0 5px", fontSize: 9, fontWeight: 500 }}>{t.label}</span> : null; })}
+        )}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <p style={{ margin: "0 0 3px", fontSize: 13, fontWeight: 500, color: done ? "var(--color-text-tertiary)" : "var(--color-text-primary)", textDecoration: done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.title}</p>
+          <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+            {task.deadline && <Badge color={overdue ? "red" : done ? "green" : isToday(task.deadline) ? "blue" : "gray"} sm>{overdue ? "Просрочено: " : ""}{task.deadline}</Badge>}
+            {task.priority === "high" && !done && <Badge color="coral" sm>срочно</Badge>}
+            {task.type === "meeting" && <Badge color="purple" sm>встреча</Badge>}
+            {(task.tags || []).map(tid => { const t = TAG_PRESETS.find(x => x.id === tid); return t ? <span key={tid} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 3, padding: "0 5px", fontSize: 9, fontWeight: 500 }}>{t.label}</span> : null; })}
           </div>
         </div>
-
-        {/* Status + chevron */}
-        <div style={{ flexShrink: 0, display: "flex", gap: 5, alignItems: "center" }}>
-          {done && <Badge color="green" sm>✓ готово</Badge>}
-          {rescheduled && <Badge color="amber" sm>перенесено</Badge>}
-          <i className={`ti ti-chevron-${expanded ? "up" : "down"}`} style={{ fontSize: 13, color: "var(--color-text-tertiary)" }} aria-hidden="true" />
+        <div style={{ flexShrink: 0, display: "flex", gap: 4, alignItems: "center" }}>
+          {done && <Badge color="green" sm>✓</Badge>}
+          {task.status === "rescheduled" && <Badge color="amber" sm>→</Badge>}
+          {statusChanging === task.id && <Spin label="" />}
+          <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{expanded ? "▲" : "▽"}</span>
         </div>
       </div>
 
-      {/* Expanded */}
+      {!done && !expanded && mode === null && (
+        <QuickActions task={task} onDone={onQuickDone} onCallback={onQuickCallback} onNoAnswer={onQuickNoAnswer} onExpand={handleExpand} busy={busy} />
+      )}
+
       {expanded && (
         <div style={{ padding: "0 11px 11px" }}>
-          {!done && <DealPreview task={task} />}
+          {hint && (
+            <div style={{ background: C.teal.bg, border: `0.5px solid ${C.teal.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 8 }}>
+              <p style={{ margin: "0 0 2px", fontSize: 9, color: C.teal.text, textTransform: "uppercase", fontWeight: 500 }}>Скрипт открытия</p>
+              <p style={{ margin: 0, fontSize: 12, color: C.teal.text }}>{hint}</p>
+            </div>
+          )}
+          {loadingHint && <div style={{ marginBottom: 8 }}><Spin label="Подготовка скрипта…" /></div>}
 
-          {done && task.comment && (
-            <div style={{ padding: "6px 10px", background: "var(--color-background-secondary)", borderRadius: 6, fontSize: 12, color: "var(--color-text-secondary)", marginTop: 4 }}>
-              {task.comment}
+          {deal && <DealPreview deal={deal} />}
+
+          {task.contact && (
+            <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, paddingTop: 8, borderTop: "0.5px solid var(--color-border-tertiary)", flexWrap: "wrap" }}>
+              <div style={{ flex: 1 }}>
+                <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{task.contact.name}</p>
+                <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{task.contact.phone}</p>
+              </div>
+              <a href={`tel:${task.contact.phone}`} style={{ textDecoration: "none" }}><button style={{ fontSize: 11, padding: "4px 10px" }}>☎ Позвонить</button></a>
             </div>
           )}
 
-          {!done && (
-            <>
-              {/* Actions */}
-              {mode === null && (
-                <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", alignItems: "center", borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8 }}>
-                  <button onClick={() => setModeAndExpand("complete")} style={{ fontSize: 11, padding: "4px 11px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Отметить выполненным">
-                    <i className="ti ti-check" style={{ fontSize: 11 }} aria-hidden="true" /> Готово
-                  </button>
-                  <button onClick={() => setModeAndExpand("reschedule")} style={{ fontSize: 11, padding: "4px 11px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Перенести">
-                    <i className="ti ti-calendar-event" style={{ fontSize: 11 }} aria-hidden="true" /> Перенести
-                  </button>
-                  <TagRow selected={task.tags} onChange={tags => onUpdate({ ...task, tags })} />
-                  <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--color-text-tertiary)" }}>цикл: {task.daysInCycle}д | сред. {AVG_CYCLE}д</span>
-                </div>
-              )}
+          {!done && mode === null && (
+            <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8 }}>
+              <button onClick={() => setMode("complete")} style={{ fontSize: 11, padding: "4px 11px" }}>✓ Результат</button>
+              <button onClick={() => setMode("reschedule")} style={{ fontSize: 11, padding: "4px 11px" }}>→ Перенести</button>
+              <div style={{ flex: 1 }} />
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {TAG_PRESETS.map(tag => {
+                  const active = (task.tags || []).includes(tag.id);
+                  return <span key={tag.id} onClick={() => onUpdateTags(task.id, active ? (task.tags || []).filter(x => x !== tag.id) : [...(task.tags || []), tag.id])} style={{ background: active ? tag.bg : "transparent", color: active ? tag.color : "var(--color-text-tertiary)", border: `0.5px solid ${active ? tag.color : "var(--color-border-tertiary)"}`, borderRadius: 4, padding: "2px 7px", fontSize: 9, cursor: "pointer" }}>{tag.label}</span>;
+                })}
+              </div>
+            </div>
+          )}
 
-              {mode === "complete" && (
-                <CompleteForm
-                  onSave={res => { onComplete(task.id, res); setMode(null); setExpanded(false); }}
-                  onCancel={() => setMode(null)}
-                />
-              )}
-              {mode === "reschedule" && (
-                <RescheduleForm
-                  task={task} allTasks={allTasks}
-                  onSave={res => { onReschedule(task.id, res); setMode(null); setExpanded(false); }}
-                  onCancel={() => setMode(null)}
-                />
-              )}
-            </>
+          {mode === "complete" && (
+            <div style={{ marginTop: 8, padding: 10, background: C.green.bg, border: `0.5px solid ${C.green.border}`, borderRadius: "var(--border-radius-md)" }}>
+              <p style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 500, color: C.green.text }}>Результат</p>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+                {RESULT_OPTS.map(r => <button key={r.id} onClick={() => setResult(r.id)} style={{ fontSize: 10, padding: "3px 9px", background: result === r.id ? C[r.color].bg : "transparent", border: result === r.id ? `1.5px solid ${C[r.color].border}` : "0.5px solid var(--color-border-tertiary)", borderRadius: 5, cursor: "pointer", color: result === r.id ? C[r.color].text : "var(--color-text-secondary)", fontWeight: result === r.id ? 500 : 400 }}>{r.label}</button>)}
+              </div>
+              <textarea value={comment} onChange={e => setComment(e.target.value)} placeholder="О чём говорили? Что договорились? Следующий шаг?" style={{ width: "100%", minHeight: 50, fontSize: 12, padding: 7, boxSizing: "border-box", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", resize: "vertical", marginBottom: 6 }} />
+              <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                <button onClick={() => setMode(null)} style={{ fontSize: 11, padding: "4px 12px" }}>Отмена</button>
+                <button onClick={saveComplete} disabled={comment.trim().length < 3} style={{ fontSize: 11, padding: "4px 12px" }}>Сохранить ↗</button>
+              </div>
+            </div>
+          )}
+
+          {mode === "reschedule" && (
+            <div style={{ marginTop: 8, padding: 10, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)" }}>
+              <p style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 500 }}>Перенести</p>
+              <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>Дата *</label>
+                  <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: "100%", fontSize: 12, padding: "5px 8px", boxSizing: "border-box" }} />
+                </div>
+              </div>
+              {slotBlocked && <p style={{ margin: "0 0 6px", fontSize: 11, color: C.red.text }}>⚠ Слот занят встречей</p>}
+              <textarea value={comment} onChange={e => setComment(e.target.value)} placeholder="Обязательно: что произошло? Почему переносим?" style={{ width: "100%", minHeight: 50, fontSize: 12, padding: 7, boxSizing: "border-box", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", resize: "vertical", marginBottom: 6 }} />
+              <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                <button onClick={() => setMode(null)} style={{ fontSize: 11, padding: "4px 12px" }}>Отмена</button>
+                <button onClick={saveReschedule} disabled={!date || comment.trim().length < 3 || slotBlocked} style={{ fontSize: 11, padding: "4px 12px" }}>Перенести ↗</button>
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -439,7 +359,7 @@ function TaskCard({ task, allTasks, onUpdate, onComplete, onReschedule, isQueue 
 }
 
 // ── Report tab ─────────────────────────────────────────────────────────────────
-function ReportTab({ tasks, backlog }) {
+function ReportTab({ tasks, queue, userName }) {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -452,54 +372,39 @@ function ReportTab({ tasks, backlog }) {
   const generate = async () => {
     setLoading(true); setErr(""); setReport(null);
     try {
-      const res = await fetch(API_URL, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: MODEL, max_tokens: 1000,
-          system: "Ты строгий руководитель отдела продаж. Честный, конкретный отчёт без воды. ТОЛЬКО JSON без markdown.",
-          messages: [{ role: "user", content: `Отчёт менеджера за ${todayStr}. Выполнено: ${done.length}/${tasks.length}. Перенесено: ${rescheduled.length}. Не закрыто: ${pending.length}. В очереди: ${backlog.length}. Детали выполненных: ${JSON.stringify(done.map(t => ({ deal: t.dealTitle, action: t.action, comment: t.comment, result: t.resultType })))}. Перенесённые: ${JSON.stringify(rescheduled.map(t => ({ deal: t.dealTitle, comment: t.comment })))}. Верни JSON: {rating,rating_comment,done_summary,risk_comment,reschedule_comment,tomorrow_top3,manager_note}` }],
-          mcp_servers: [BITRIX_MCP]
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
-      const s = text.indexOf("{"), e = text.lastIndexOf("}");
-      if (s >= 0 && e >= 0) setReport(JSON.parse(text.slice(s, e + 1)));
-      else setErr("Не удалось разобрать ответ");
+      const text = await claudeCall(
+        `Отчёт менеджера ${userName} за ${todayStr}. Выполнено: ${done.length}/${tasks.length}. Перенесено: ${rescheduled.length}. Не закрыто: ${pending.length}. Очередь: ${queue.length}. Выполненные: ${JSON.stringify(done.map(t => ({ title: t.title, result: t.resultType, comment: t.comment })))}. Перенесённые: ${JSON.stringify(rescheduled.map(t => ({ title: t.title, comment: t.comment })))}. Верни JSON: {rating,rating_comment,done_summary,risks:[{deal,risk}],tomorrow:[{action}],manager_note}`,
+        "Строгий РОП. Честный отчёт без воды. ТОЛЬКО JSON без markdown."
+      );
+      const parsed = parseJSON(text);
+      setReport(parsed || { rating: 5, rating_comment: "Данных недостаточно", done_summary: `Выполнено ${done.length} из ${tasks.length}`, risks: [], tomorrow: [], manager_note: "" });
     } catch (e) { setErr(e.message); }
     setLoading(false);
   };
 
-  const rc = (r) => r >= 8 ? "green" : r >= 5 ? "amber" : "red";
+  const rc = r => r >= 8 ? "green" : r >= 5 ? "amber" : "red";
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
-        {[["Выполнено", done.length, "green"], ["Перенесено", rescheduled.length, "amber"], ["Не закрыто", pending.length, pending.length > 0 ? "coral" : "gray"], ["Очередь", backlog.length, "blue"]].map(([l, v, c]) => (
-          <div key={l} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "8px 12px", flex: 1, minWidth: 70 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        {[["Выполнено", done.length, "green"], ["Перенесено", rescheduled.length, "amber"], ["Не закрыто", pending.length, pending.length > 0 ? "coral" : "gray"]].map(([l, v, c]) => (
+          <div key={l} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "8px 12px", flex: 1 }}>
             <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-secondary)" }}>{l}</p>
-            <p style={{ margin: 0, fontSize: 18, fontWeight: 500, color: C[c].text }}>{v}</p>
+            <p style={{ margin: 0, fontSize: 20, fontWeight: 500, color: C[c].text }}>{v}</p>
           </div>
         ))}
       </div>
-
-      <div style={{ marginBottom: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>
-          <span>Прогресс дня</span><span>{pct}%</span>
-        </div>
-        <div style={{ height: 5, background: "var(--color-background-secondary)", borderRadius: 3, overflow: "hidden" }}>
-          <div style={{ height: "100%", width: `${pct}%`, background: C.green.border, borderRadius: 3 }} />
-        </div>
+      <div style={{ height: 4, background: "var(--color-background-secondary)", borderRadius: 2, marginBottom: 14, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: C.green.border, borderRadius: 2 }} />
       </div>
-
       {done.length > 0 && (
         <div style={{ marginBottom: 14 }}>
-          <p style={{ margin: "0 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Выполненные дела</p>
+          <p style={{ margin: "0 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase" }}>Выполненные дела</p>
           {done.map(t => (
-            <div key={t.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-              <span style={{ color: C.green.text, fontSize: 12, flexShrink: 0 }}>✓</span>
+            <div key={t.id} style={{ display: "flex", gap: 8, padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+              <span style={{ color: C.green.text }}>✓</span>
               <div style={{ flex: 1 }}>
-                <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{t.dealTitle}</p>
+                <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{t.title}</p>
                 <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{t.comment || "—"}</p>
               </div>
               {t.resultType && <Badge color={RESULT_OPTS.find(r => r.id === t.resultType)?.color || "gray"} sm>{RESULT_OPTS.find(r => r.id === t.resultType)?.label}</Badge>}
@@ -507,17 +412,15 @@ function ReportTab({ tasks, backlog }) {
           ))}
         </div>
       )}
-
       <button onClick={generate} disabled={loading} style={{ fontSize: 12, padding: "7px 16px" }}>
-        {loading ? <Spin label="Анализируем день…" /> : "Отчёт для руководителя ↗"}
+        {loading ? <Spin label="Анализируем…" /> : "Отчёт для руководителя ↗"}
       </button>
       {err && <p style={{ fontSize: 11, color: C.red.text, marginTop: 6 }}>{err}</p>}
-
       {report && (
         <div style={{ marginTop: 12 }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px 12px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", marginBottom: 10 }}>
-            <div style={{ width: 42, height: 42, borderRadius: "50%", background: C[rc(report.rating)].bg, color: C[rc(report.rating)].text, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-              <span style={{ fontSize: 15, fontWeight: 500 }}>{report.rating}</span>
+            <div style={{ width: 44, height: 44, borderRadius: "50%", background: C[rc(report.rating)].bg, color: C[rc(report.rating)].text, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <span style={{ fontSize: 16, fontWeight: 500 }}>{report.rating}</span>
               <span style={{ fontSize: 8 }}>из 10</span>
             </div>
             <div>
@@ -525,179 +428,325 @@ function ReportTab({ tasks, backlog }) {
               <p style={{ margin: 0, fontSize: 12, color: "var(--color-text-secondary)" }}>{report.done_summary}</p>
             </div>
           </div>
-          {report.risk_comment && <div style={{ background: C.coral.bg, border: `0.5px solid ${C.coral.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 6 }}><p style={{ margin: 0, fontSize: 12, color: C.coral.text }}>{report.risk_comment}</p></div>}
-          {report.reschedule_comment && <div style={{ background: C.amber.bg, border: `0.5px solid ${C.amber.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 6 }}><p style={{ margin: 0, fontSize: 12, color: C.amber.text }}>{report.reschedule_comment}</p></div>}
-          {report.tomorrow_top3 && (
-            <div style={{ marginTop: 8 }}>
-              <p style={{ margin: "0 0 5px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Приоритеты завтра</p>
-              {(Array.isArray(report.tomorrow_top3) ? report.tomorrow_top3 : [report.tomorrow_top3]).map((a, i) => (
-                <div key={i} style={{ display: "flex", gap: 7, alignItems: "flex-start", padding: "5px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-                  <span style={{ width: 16, height: 16, borderRadius: "50%", background: C.blue.bg, color: C.blue.text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 500, flexShrink: 0, marginTop: 1 }}>{i + 1}</span>
-                  <span style={{ fontSize: 12 }}>{typeof a === "string" ? a : a.action || JSON.stringify(a)}</span>
+          {(report.risks || []).length > 0 && report.risks.map((r, i) => (
+            <div key={i} style={{ background: C.coral.bg, border: `0.5px solid ${C.coral.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 6 }}>
+              <p style={{ margin: 0, fontSize: 12, color: C.coral.text }}><strong>{r.deal}:</strong> {r.risk}</p>
+            </div>
+          ))}
+          {(report.tomorrow || []).length > 0 && (
+            <>
+              <p style={{ margin: "10px 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase" }}>Приоритеты завтра</p>
+              {report.tomorrow.map((a, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, padding: "5px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                  <span style={{ width: 16, height: 16, borderRadius: "50%", background: C.blue.bg, color: C.blue.text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, flexShrink: 0 }}>{i + 1}</span>
+                  <span style={{ fontSize: 12 }}>{typeof a === "string" ? a : a.action}</span>
                 </div>
               ))}
+            </>
+          )}
+          {report.manager_note && (
+            <div style={{ marginTop: 8, padding: "7px 10px", border: `0.5px solid ${C.purple.border}`, borderRadius: "var(--border-radius-md)", background: C.purple.bg }}>
+              <p style={{ margin: "0 0 2px", fontSize: 9, color: C.purple.text, textTransform: "uppercase", fontWeight: 500 }}>Заметка руководителю</p>
+              <p style={{ margin: 0, fontSize: 12, color: C.purple.text }}>{report.manager_note}</p>
             </div>
           )}
-          {report.manager_note && <div style={{ marginTop: 8, padding: "7px 10px", border: `0.5px solid ${C.purple.border}`, borderRadius: "var(--border-radius-md)", background: C.purple.bg }}><p style={{ margin: "0 0 2px", fontSize: 9, color: C.purple.text, textTransform: "uppercase", fontWeight: 500 }}>Заметка руководителю</p><p style={{ margin: 0, fontSize: 12, color: C.purple.text }}>{report.manager_note}</p></div>}
         </div>
       )}
-    </div>
-  );
-}
-
-// ── Admin tab ─────────────────────────────────────────────────────────────────
-function AdminTab() {
-  const rules = ["Обязательный комментарий при переносе","Блокировка слотов при встречах","Отчёт руководителю в конце дня","Запрет закрытия без результата"];
-  return (
-    <div>
-      <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 500 }}>Теги организации</p>
-      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 14 }}>
-        {TAG_PRESETS.map(t => <span key={t.id} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 5, padding: "3px 9px", fontSize: 11, fontWeight: 500 }}>{t.label}</span>)}
-      </div>
-      <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 12, marginBottom: 14 }}>
-        <p style={{ margin: "0 0 8px", fontSize: 13, fontWeight: 500 }}>Правила воркспейса</p>
-        {rules.map((r, i) => (
-          <label key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, padding: "5px 0", borderBottom: "0.5px solid var(--color-border-tertiary)", cursor: "pointer" }}>
-            <input type="checkbox" defaultChecked style={{ cursor: "pointer" }} />{r}
-          </label>
-        ))}
-      </div>
-      <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 12 }}>
-        <p style={{ margin: "0 0 8px", fontSize: 13, fontWeight: 500 }}>Сотрудники</p>
-        {["Иванов А. — Розничный отдел", "Петрова М. — Розничный отдел", "Сидоров К. — Оптовый отдел"].map((s, i) => (
-          <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12 }}>
-            <span>{s}</span><Badge color="blue" sm>Менеджер</Badge>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [schedule, setSchedule] = useState(DEMO_SCHEDULE);
-  const [queue, setQueue] = useState(DEMO_QUEUE);
-  const [tab, setTab] = useState("schedule");
+  const [b24params] = useState(getB24());
+  const [currentUser, setCurrentUser] = useState(null);
+  const [viewUser, setViewUser] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [deals, setDeals] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [queue, setQueue] = useState([]);
+  const [calEvents, setCalEvents] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadMsg, setLoadMsg] = useState("");
+  const [errors, setErrors] = useState([]);
+  const [tab, setTab] = useState("today");
+  const [busy, setBusy] = useState(false);
+  const [statusChanging, setStatusChanging] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
 
-  const done = schedule.filter(t => t.status === "done");
-  const active = schedule.filter(t => t.status !== "done");
+  const addErr = (msg) => setErrors(e => [...e.slice(-2), msg]);
 
-  const handleUpdate = useCallback((updated) => setSchedule(ts => ts.map(t => t.id === updated.id ? updated : t)), []);
-
-  const handleComplete = useCallback(async (id, { result, comment }) => {
-    setSchedule(ts => ts.map(t => t.id === id ? { ...t, status: "done", comment, resultType: result } : t));
-    try {
-      await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 100, system: "Bitrix24 MCP. Обнови задачу.", messages: [{ role: "user", content: `Закрой задачу, добавь комментарий: "${comment}", статус 5.` }], mcp_servers: [BITRIX_MCP] }) });
-    } catch (e) { console.warn("Bitrix write-back:", e.message); }
+  // ── Load current user on mount ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!b24params.domain || !b24params.sid) return;
+    (async () => {
+      setLoading(true); setLoadMsg("Определяем пользователя…");
+      try {
+        const user = await b24(b24params.domain, b24params.sid, "user.current");
+        const u = { id: user.ID, name: `${user.NAME} ${user.LAST_NAME}`.trim(), position: user.WORK_POSITION || "Менеджер", isAdmin: user.IS_ADMIN === "Y" };
+        setCurrentUser(u);
+        setViewUser(u);
+        setIsAdmin(u.isAdmin);
+        if (u.isAdmin) {
+          const allUsers = await b24(b24params.domain, b24params.sid, "user.get", { filter: { ACTIVE: true } });
+          setUsers((allUsers || []).map(x => ({ id: x.ID, name: `${x.NAME} ${x.LAST_NAME}`.trim(), position: x.WORK_POSITION || "Менеджер" })));
+        }
+      } catch (e) { addErr(e.message); }
+      setLoading(false); setLoadMsg("");
+    })();
   }, []);
 
-  const handleReschedule = useCallback(async (id, { date, time, comment }) => {
-    setSchedule(ts => ts.map(t => t.id === id ? { ...t, status: "rescheduled", comment, timeStart: time || t.timeStart } : t));
+  // ── Load data when viewUser changes ───────────────────────────────────────
+  useEffect(() => {
+    if (!viewUser || !b24params.domain) return;
+    loadUserData(viewUser.id);
+  }, [viewUser]);
+
+  const loadUserData = useCallback(async (userId) => {
+    setLoading(true); setDeals([]); setTasks([]); setQueue([]); setCalEvents([]);
     try {
-      await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 100, system: "Bitrix24 MCP. Обнови задачу.", messages: [{ role: "user", content: `Перенеси задачу на ${date} ${time}, добавь комментарий: "${comment}"` }], mcp_servers: [BITRIX_MCP] }) });
-    } catch (e) { console.warn("Bitrix write-back:", e.message); }
+      setLoadMsg("Загружаем сделки…");
+      const dealsRaw = await b24(b24params.domain, b24params.sid, "crm.deal.list", {
+        filter: { ASSIGNED_BY_ID: userId, "!STAGE_ID": ["WON", "LOSE"] },
+        select: ["ID", "TITLE", "STAGE_ID", "OPPORTUNITY", "CURRENCY_ID", "DATE_CREATE", "COMMENTS", "CONTACT_ID"]
+      });
+      setDeals(dealsRaw || []);
+
+      setLoadMsg("Загружаем задачи…");
+      const tasksRaw = await b24(b24params.domain, b24params.sid, "tasks.task.list", {
+        filter: { RESPONSIBLE_ID: userId, "!STATUS": 5 },
+        select: ["ID", "TITLE", "STATUS", "PRIORITY", "DEADLINE", "UF_CRM_TASK", "DESCRIPTION", "CREATED_BY"]
+      });
+
+      const now = new Date();
+      const allTasks = ((tasksRaw || {}).tasks || tasksRaw || []).map(t => ({
+        id: t.ID || t.id,
+        title: t.TITLE || t.title,
+        status: "pending",
+        priority: (t.PRIORITY || t.priority) > 1 ? "high" : "medium",
+        deadline: fmtDate(t.DEADLINE || t.deadline),
+        dealId: ((t.UF_CRM_TASK || t.uf_crm_task || [])[0] || "").replace(/^D_/, ""),
+        description: t.DESCRIPTION || t.description || "",
+        type: "call",
+        tags: [],
+        comment: "",
+        timeStart: null,
+        timeEnd: null,
+      }));
+
+      const todayTasks = allTasks.filter(t => isToday(t.deadline));
+      const futureTasks = allTasks.filter(t => isFuture(t.deadline));
+      const overdueTasks = allTasks.filter(t => isOverdue(t.deadline));
+
+      setTasks([...overdueTasks, ...todayTasks]);
+      setQueue(futureTasks);
+
+      setLoadMsg("Загружаем календарь…");
+      try {
+        const evRaw = await b24(b24params.domain, b24params.sid, "calendar.event.getNearest", { type: "user", ownerId: userId });
+        const evArr = Array.isArray(evRaw) ? evRaw : [];
+        const todayEvs = evArr.filter(e => fmtDate(e.DATE_FROM) === todayStr).map(e => ({
+          id: e.ID,
+          title: e.NAME,
+          timeStart: e.DATE_FROM ? new Date(e.DATE_FROM).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : "",
+          timeEnd: e.DATE_TO ? new Date(e.DATE_TO).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : "",
+          type: "meeting",
+        }));
+        setCalEvents(todayEvs);
+      } catch { /* calendar not critical */ }
+
+    } catch (e) { addErr(e.message); }
+    setLoading(false); setLoadMsg("");
+  }, [b24params]);
+
+  // ── Task actions ──────────────────────────────────────────────────────────
+  const quickAction = useCallback(async (taskId, resultType, autoComment) => {
+    setStatusChanging(taskId);
+    setTasks(ts => ts.filter(t => t.id !== taskId));
+    try {
+      await b24(b24params.domain, b24params.sid, "tasks.task.update", { taskId, fields: { STATUS: 5 } });
+      await b24(b24params.domain, b24params.sid, "task.comment.add", { TASK_ID: taskId, FIELDS: { POST_MESSAGE: autoComment } });
+    } catch (e) { addErr(e.message); }
+    setStatusChanging(null);
+  }, [b24params]);
+
+  const handleComplete = useCallback(async (taskId, { result, comment }) => {
+    setBusy(true);
+    setTasks(ts => ts.map(t => t.id === taskId ? { ...t, status: "done", comment, resultType: result } : t));
+    try {
+      await b24(b24params.domain, b24params.sid, "tasks.task.update", { taskId, fields: { STATUS: 5 } });
+      await b24(b24params.domain, b24params.sid, "task.comment.add", { TASK_ID: taskId, FIELDS: { POST_MESSAGE: `[${RESULT_OPTS.find(r => r.id === result)?.label}] ${comment}` } });
+    } catch (e) { addErr(e.message); }
+    setBusy(false);
+  }, [b24params]);
+
+  const handleReschedule = useCallback(async (taskId, { date, comment }) => {
+    setBusy(true);
+    const newDl = new Date(date).toISOString();
+    setTasks(ts => ts.map(t => t.id === taskId ? { ...t, status: "rescheduled", comment, deadline: fmtDate(newDl) } : t));
+    try {
+      await b24(b24params.domain, b24params.sid, "tasks.task.update", { taskId, fields: { DEADLINE: newDl } });
+      await b24(b24params.domain, b24params.sid, "task.comment.add", { TASK_ID: taskId, FIELDS: { POST_MESSAGE: `[Перенесено на ${fmtDate(newDl)}] ${comment}` } });
+    } catch (e) { addErr(e.message); }
+    setBusy(false);
+  }, [b24params]);
+
+  const handleUpdateTags = useCallback((taskId, tags) => {
+    setTasks(ts => ts.map(t => t.id === taskId ? { ...t, tags } : t));
+    setQueue(qs => qs.map(t => t.id === taskId ? { ...t, tags } : t));
   }, []);
 
-  const loadFromBitrix = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 1000, system: "Bitrix24 MCP. ТОЛЬКО JSON без markdown.", messages: [{ role: "user", content: `Получи задачи пользователя на ${todayStr} из Bitrix24. Верни JSON: {schedule:[{id,type,timeStart,timeEnd,dealId,dealTitle,action,priority,stage,amount,daysInCycle,lastTouch,contact:{name,phone},files:[{name,type}],tags,status,blocksSlot,comment}], queue:[...]}` }], mcp_servers: [BITRIX_MCP] }) });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
-      const s = text.indexOf("{"), e = text.lastIndexOf("}");
-      if (s >= 0 && e >= 0) {
-        const p = JSON.parse(text.slice(s, e + 1));
-        if (Array.isArray(p.schedule)) setSchedule(p.schedule);
-        if (Array.isArray(p.queue)) setQueue(p.queue);
-      }
-    } catch (e) { console.warn("Load error:", e.message); }
-    setLoading(false);
-  }, []);
+  // ── Computed ─────────────────────────────────────────────────────────────
+  const todayTasks = tasks.filter(t => isToday(t.deadline) && t.status !== "done" && t.status !== "rescheduled");
+  const overdueTasks = tasks.filter(t => isOverdue(t.deadline));
+  const doneTasks = tasks.filter(t => t.status === "done");
+  const rescheduledTasks = tasks.filter(t => t.status === "rescheduled");
 
-  const moveToSchedule = (taskId, time) => {
-    const t = queue.find(x => x.id === taskId);
-    if (!t) return;
-    setQueue(q => q.filter(x => x.id !== taskId));
-    setSchedule(s => [...s, { ...t, timeStart: time || "09:00", timeEnd: "10:00" }]);
-  };
+  const noB24 = !b24params.domain || !b24params.sid;
 
   const TABS = [
-    { id: "schedule", label: `Сегодня (${active.length})` },
-    { id: "queue",    label: `Очередь (${queue.length})` },
-    { id: "report",   label: `Отчёт${done.length > 0 ? " ●" : ""}` },
-    { id: "admin",    label: "Настройки" },
+    { id: "today",  label: `Сегодня (${todayTasks.length})` },
+    { id: "queue",  label: `Очередь (${queue.length})` },
+    { id: "report", label: `Отчёт${doneTasks.length > 0 ? " ●" : ""}` },
+    { id: "settings", label: "Настройки" },
   ];
 
   return (
     <div style={{ padding: "0 0 2rem" }}>
-      <h2 className="sr-only">Ежедневный воркспейс менеджера</h2>
-
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
         <div>
           <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Рабочий день</p>
           <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>{todayStr}</h2>
         </div>
-        <button onClick={loadFromBitrix} disabled={loading} style={{ fontSize: 11, padding: "5px 12px", display: "flex", alignItems: "center", gap: 5 }}>
-          {loading ? <Spin label="Загрузка…" /> : "↻ Из Bitrix24"}
-        </button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {isAdmin && users.length > 0 && (
+            <select onChange={e => { const u = users.find(x => String(x.id) === e.target.value); if (u) setViewUser(u); }} value={String(viewUser?.id || "")} style={{ fontSize: 12, padding: "5px 10px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)" }}>
+              {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+          )}
+          <button onClick={() => viewUser && loadUserData(viewUser.id)} disabled={loading} style={{ fontSize: 11, padding: "5px 12px" }}>↻ Обновить</button>
+        </div>
       </div>
 
-      <MiniGrid tasks={schedule} />
+      {/* No B24 warning */}
+      {noB24 && (
+        <div style={{ background: C.amber.bg, border: `0.5px solid ${C.amber.border}`, borderRadius: "var(--border-radius-lg)", padding: "14px 16px", marginBottom: 16 }}>
+          <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 500, color: C.amber.text }}>Откройте приложение из Bitrix24</p>
+          <p style={{ margin: 0, fontSize: 12, color: C.amber.text }}>Прямой переход по URL не поддерживается — Bitrix24 должен передать параметры авторизации.</p>
+        </div>
+      )}
+
+      {/* Errors */}
+      {errors.map((e, i) => <div key={i} style={{ background: C.red.bg, border: `0.5px solid ${C.red.border}`, borderRadius: "var(--border-radius-md)", padding: "8px 12px", marginBottom: 8 }}><p style={{ margin: 0, fontSize: 12, color: C.red.text }}>⚠ {e}</p></div>)}
+
+      {/* Loading */}
+      {loading && <div style={{ marginBottom: 12 }}><Spin label={loadMsg} /></div>}
+
+      {/* User bar */}
+      {viewUser && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)" }}>
+          <div style={{ width: 30, height: 30, borderRadius: "50%", background: C.purple.bg, color: C.purple.text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 500, flexShrink: 0 }}>
+            {viewUser.name.split(" ").slice(0, 2).map(n => n[0]).join("")}
+          </div>
+          <div style={{ flex: 1 }}>
+            <p style={{ margin: 0, fontSize: 13, fontWeight: 500 }}>{viewUser.name}</p>
+            <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{viewUser.position}</p>
+          </div>
+          {isAdmin && currentUser?.id !== viewUser?.id && <Badge color="purple" sm>просмотр</Badge>}
+        </div>
+      )}
+
+      {/* Calendar grid */}
+      {calEvents.length > 0 && <MiniGrid events={calEvents} />}
 
       {/* Stats */}
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-        {[["Дел сегодня", schedule.length, "gray"], ["Выполнено", done.length, "green"], ["Встречи", schedule.filter(t => t.blocksSlot).length, "purple"], ["Очередь", queue.length, "blue"]].map(([l, v, c]) => (
-          <div key={l} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "8px 12px", flex: 1, minWidth: 70 }}>
-            <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-secondary)" }}>{l}</p>
-            <p style={{ margin: 0, fontSize: 18, fontWeight: 500, color: C[c].text }}>{v}</p>
-          </div>
-        ))}
+        <StatCard label="Сегодня" value={todayTasks.length} color="blue" />
+        <StatCard label="Выполнено" value={doneTasks.length} color="green" />
+        <StatCard label="Просрочено" value={overdueTasks.length} color={overdueTasks.length > 0 ? "red" : "gray"} />
+        <StatCard label="Очередь" value={queue.length} color="gray" />
       </div>
+
+      {/* Overdue alert */}
+      {overdueTasks.length > 0 && (
+        <div style={{ background: C.red.bg, border: `0.5px solid ${C.red.border}`, borderRadius: "var(--border-radius-lg)", padding: "10px 12px", marginBottom: 12 }}>
+          <p style={{ margin: "0 0 6px", fontSize: 12, fontWeight: 500, color: C.red.text }}>⚠ Просроченные — закрыть или перенести</p>
+          {overdueTasks.map(t => (
+            <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0", borderBottom: `0.5px solid ${C.red.border}` }}>
+              <span style={{ flex: 1, fontSize: 12, color: C.red.text }}>{t.title}</span>
+              <span style={{ fontSize: 11, color: C.red.text }}>{t.deadline}</span>
+              <button onClick={() => handleReschedule(t.id, { date: tomorrowISO(), comment: "Автоперенос на завтра" })} disabled={busy} style={{ fontSize: 10, padding: "2px 8px" }}>→ Завтра</button>
+              <button onClick={() => quickAction(t.id, "done", "Закрыто")} disabled={busy} style={{ fontSize: 10, padding: "2px 8px" }}>✓</button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Tabs */}
       <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: 12 }}>
-        {TABS.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{ background: "transparent", border: "none", padding: "6px 12px", fontSize: 12, cursor: "pointer", color: tab === t.id ? "var(--color-text-primary)" : "var(--color-text-secondary)", borderBottom: tab === t.id ? "2px solid var(--color-text-primary)" : "2px solid transparent", fontWeight: tab === t.id ? 500 : 400 }}>{t.label}</button>
-        ))}
+        {TABS.map(t => <button key={t.id} onClick={() => setTab(t.id)} style={{ background: "transparent", border: "none", padding: "6px 12px", fontSize: 12, cursor: "pointer", color: tab === t.id ? "var(--color-text-primary)" : "var(--color-text-secondary)", borderBottom: tab === t.id ? "2px solid var(--color-text-primary)" : "2px solid transparent", fontWeight: tab === t.id ? 500 : 400 }}>{t.label}</button>)}
       </div>
 
-      {/* Schedule tab */}
-      {tab === "schedule" && (
+      {/* Today tab */}
+      {tab === "today" && (
         <>
-          {active.map(t => <TaskCard key={t.id} task={t} allTasks={schedule} onUpdate={handleUpdate} onComplete={handleComplete} onReschedule={handleReschedule} />)}
-          {done.length > 0 && (
+          {todayTasks.length === 0 && !loading && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Нет дел на сегодня. Возьмите задачи из очереди.</p>}
+          {todayTasks.map(t => <TaskCard key={t.id} task={t} allTasks={[...tasks, ...calEvents]} deals={deals}
+            onQuickDone={id => quickAction(id, "done", "Выполнено")}
+            onQuickCallback={id => quickAction(id, "callback", "Клиент перезвонит")}
+            onQuickNoAnswer={id => quickAction(id, "no_answer", "Не ответил")}
+            onComplete={handleComplete} onReschedule={handleReschedule} onUpdateTags={handleUpdateTags}
+            busy={busy} statusChanging={statusChanging} />)}
+          {doneTasks.length > 0 && (
             <>
-              <p style={{ margin: "10px 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Выполнено ({done.length})</p>
-              {done.map(t => <TaskCard key={t.id} task={t} allTasks={schedule} onUpdate={handleUpdate} onComplete={handleComplete} onReschedule={handleReschedule} />)}
+              <p style={{ margin: "12px 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase" }}>Выполнено ({doneTasks.length})</p>
+              {doneTasks.map(t => <TaskCard key={t.id} task={t} allTasks={tasks} deals={deals}
+                onQuickDone={() => {}} onQuickCallback={() => {}} onQuickNoAnswer={() => {}}
+                onComplete={handleComplete} onReschedule={handleReschedule} onUpdateTags={handleUpdateTags}
+                busy={busy} statusChanging={statusChanging} />)}
             </>
           )}
-          {schedule.length === 0 && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Нет дел. Загрузите из Bitrix24 или перенесите из очереди.</p>}
         </>
       )}
 
       {/* Queue tab */}
       {tab === "queue" && (
         <>
-          <p style={{ margin: "0 0 8px", fontSize: 12, color: "var(--color-text-secondary)" }}>Дела без времени — возьмите в работу или запланируйте</p>
-          {queue.map(t => (
-            <div key={t.id} style={{ position: "relative" }}>
-              <TaskCard task={t} allTasks={schedule}
-                onUpdate={u => setQueue(q => q.map(x => x.id === u.id ? u : x))}
-                onComplete={(id, res) => setQueue(q => q.map(x => x.id === id ? { ...x, status: "done", comment: res.comment, resultType: res.result } : x))}
-                onReschedule={(id, res) => moveToSchedule(id, res.time)}
-                isQueue
-              />
-            </div>
-          ))}
-          {queue.length === 0 && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Очередь пуста — все дела распределены по времени</p>}
+          <p style={{ margin: "0 0 8px", fontSize: 12, color: "var(--color-text-secondary)" }}>Задачи без даты или на будущие дни</p>
+          {queue.length === 0 && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Очередь пуста</p>}
+          {queue.map(t => <TaskCard key={t.id} task={t} allTasks={tasks} deals={deals}
+            onQuickDone={id => quickAction(id, "done", "Выполнено")}
+            onQuickCallback={id => quickAction(id, "callback", "Клиент перезвонит")}
+            onQuickNoAnswer={id => quickAction(id, "no_answer", "Не ответил")}
+            onComplete={handleComplete} onReschedule={handleReschedule} onUpdateTags={handleUpdateTags}
+            busy={busy} statusChanging={statusChanging} isQueue />)}
         </>
       )}
 
-      {tab === "report" && <ReportTab tasks={schedule} backlog={queue} />}
-      {tab === "admin" && <AdminTab />}
+      {tab === "report" && <ReportTab tasks={tasks} queue={queue} userName={viewUser?.name || ""} />}
+
+      {tab === "settings" && (
+        <div>
+          <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 500 }}>Теги</p>
+          <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 16 }}>
+            {TAG_PRESETS.map(t => <span key={t.id} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 5, padding: "3px 9px", fontSize: 11, fontWeight: 500 }}>{t.label}</span>)}
+          </div>
+          <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 12 }}>
+            <p style={{ margin: "0 0 8px", fontSize: 13, fontWeight: 500 }}>Правила</p>
+            {["Обязательный комментарий при переносе", "Блокировка слотов при встречах", "Запрет закрытия без результата", "Отчёт руководителю в конце дня"].map((r, i) => (
+              <label key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, padding: "5px 0", borderBottom: "0.5px solid var(--color-border-tertiary)", cursor: "pointer" }}>
+                <input type="checkbox" defaultChecked />{r}
+              </label>
+            ))}
+          </div>
+          <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 12, marginTop: 4 }}>
+            <p style={{ margin: "0 0 4px", fontSize: 10, color: "var(--color-text-tertiary)" }}>Подключение</p>
+            <p style={{ margin: 0, fontSize: 12 }}>{b24params.domain || "Не подключено"}</p>
+            <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-tertiary)" }}>APP_SID: {b24params.sid ? b24params.sid.slice(0, 8) + "…" : "—"}</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
