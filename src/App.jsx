@@ -1,10 +1,15 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback } from "react";
 
-const API_URL = "https://api.anthropic.com/v1/messages";
+const API_URL = "/api/claude";
 const MODEL = "claude-sonnet-4-20250514";
 const BITRIX_MCP = { type: "url", url: "https://mcp.bitrix24.com/mcp", name: "bitrix24" };
+const HOURS = Array.from({ length: 11 }, (_, i) => i + 9);
+const AVG_CYCLE = 18;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+const today = new Date();
+const todayStr = today.toLocaleDateString("ru-RU");
+const toMins = (t = "00:00") => { const [h, m] = t.split(":"); return +h * 60 + (+m || 0); };
+
 const C = {
   purple: { bg: "#EEEDFE", text: "#3C3489", border: "#AFA9EC" },
   teal:   { bg: "#E1F5EE", text: "#0F6E56", border: "#5DCAA5" },
@@ -16,646 +21,683 @@ const C = {
   red:    { bg: "#FCEBEB", text: "#791F1F", border: "#F09595" },
 };
 
-const todayStr = () => new Date().toLocaleDateString("ru-RU");
-const tomorrowStr = () => { const d = new Date(); d.setDate(d.getDate()+1); return d.toLocaleDateString("ru-RU"); };
-const isOverdue = (dl) => {
-  if (!dl) return false;
-  const parts = dl.split(".");
-  if (parts.length < 3) return false;
-  const date = new Date(parts[2], parts[1]-1, parts[0]);
-  return date < new Date(new Date().toDateString());
-};
-const isTodayOrFuture = (dl) => !dl || !isOverdue(dl);
+const TAG_PRESETS = [
+  { id: "hot",      label: "Горячий",          color: "#A32D2D", bg: "#FCEBEB" },
+  { id: "kp_wait",  label: "Ждёт КП",          color: "#854F0B", bg: "#FAEEDA" },
+  { id: "negotiat", label: "Переговоры",        color: "#185FA5", bg: "#E6F1FB" },
+  { id: "contract", label: "Готов к договору",  color: "#3B6D11", bg: "#EAF3DE" },
+  { id: "slow",     label: "Долго думает",      color: "#5F5E5A", bg: "#F1EFE8" },
+  { id: "vip",      label: "VIP",               color: "#534AB7", bg: "#EEEDFE" },
+];
 
-const TASK_STATUS = { 1:"Новая", 2:"Ожидает", 3:"В работе", 5:"Завершена", 6:"Отложена" };
-const DEAL_STAGE_COLOR = { NEW:"blue", PREPARATION:"purple", PREPAYMENT_INVOICE:"amber", EXECUTING:"amber", FINAL_INVOICE:"teal", WON:"green", LOSE:"red", APOLOGY:"red" };
-
-const extractText = (content=[]) => content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
-const parseJSON = (text) => {
-  try {
-    const clean = text.replace(/```json|```/g,"").trim();
-    const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
-    if (s<0||e<0) return null;
-    return JSON.parse(clean.slice(s,e+1));
-  } catch { return null; }
-};
-const parseArr = (text) => {
-  try {
-    const clean = text.replace(/```json|```/g,"").trim();
-    const s = clean.indexOf("["), e = clean.lastIndexOf("]");
-    if (s<0||e<0) return null;
-    return JSON.parse(clean.slice(s,e+1));
-  } catch { return null; }
+const STAGES = {
+  NEW:          { label: "Новая",           color: "blue" },
+  PREPARATION:  { label: "Подготовка",      color: "purple" },
+  KP_SENT:      { label: "КП отправлено",   color: "amber" },
+  NEGOTIATION:  { label: "Переговоры",      color: "teal" },
+  CONTRACT:     { label: "Договор",         color: "green" },
+  WON:          { label: "Выиграна",        color: "green" },
+  LOSE:         { label: "Проиграна",       color: "red" },
 };
 
-// ── low-level api call ────────────────────────────────────────────────────────
-async function callClaude(userMsg, systemMsg, history=[]) {
-  const messages = [...history.map(h=>({role:h.role, content:h.content})), {role:"user", content:userMsg}];
-  const res = await fetch(API_URL, {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ model:MODEL, max_tokens:1000, system:systemMsg, messages, mcp_servers:[BITRIX_MCP] })
-  });
-  if (!res.ok) { const err = await res.json().catch(()=>{}); throw new Error(err?.error?.message || `HTTP ${res.status}`); }
-  return await res.json();
+const FILE_COLOR = { kp: "blue", tz: "purple", contract: "green", photo: "teal", other: "gray" };
+const FILE_LABEL = { kp: "КП", tz: "ТЗ", contract: "Договор", photo: "Фото", other: "Файл" };
+
+const RESULT_OPTS = [
+  { id: "done",      label: "Выполнено",    color: "green"  },
+  { id: "callback",  label: "Перезвонит",   color: "blue"   },
+  { id: "no_answer", label: "Не ответил",   color: "amber"  },
+  { id: "refuse",    label: "Отказ",        color: "red"    },
+];
+
+// ── Demo data ────────────────────────────────────────────────────────────────
+const DEMO_SCHEDULE = [
+  { id:1, type:"call", timeStart:"09:00", timeEnd:"10:00",
+    dealId:"73668", dealTitle:"ООО Альфастрой — остекление лоджий",
+    action:"узнать как КП", priority:"high", stage:"KP_SENT",
+    amount:285000, daysInCycle:14,
+    lastTouch:"23.05 — Отправили КП на 285 000 ₽. Клиент попросил подумать до пятницы. Контакт: Олег, доброжелательный.",
+    contact:{ name:"Семёнов О.В.", phone:"+7 (916) 234-56-78" },
+    files:[{ name:"КП_Альфастрой_v2.pdf", type:"kp" },{ name:"ТЗ_лоджии.docx", type:"tz" }],
+    tags:["hot"], status:"pending", blocksSlot:false, comment:"" },
+
+  { id:2, type:"call", timeStart:"11:00", timeEnd:"12:00",
+    dealId:"73480", dealTitle:"ИП Кузнецов — балкон под ключ",
+    action:"узнать как КП", priority:"medium", stage:"KP_SENT",
+    amount:142000, daysInCycle:7,
+    lastTouch:"24.05 — Первый контакт. КП отправлено. Торгуется по цене.",
+    contact:{ name:"Кузнецов П.А.", phone:"+7 (903) 345-67-89" },
+    files:[{ name:"КП_Кузнецов.pdf", type:"kp" }],
+    tags:["kp_wait"], status:"pending", blocksSlot:false, comment:"" },
+
+  { id:3, type:"meeting", timeStart:"13:00", timeEnd:"15:00",
+    dealId:"72886", dealTitle:"ООО Горизонт — офис 18 окон",
+    action:"встреча в офисе клиента", priority:"high", stage:"NEGOTIATION",
+    amount:890000, daysInCycle:22,
+    lastTouch:"22.05 — Встреча перенесена клиентом. Договорились 28.05 в 13:00. Готовы к договору, обсуждаем рассрочку.",
+    contact:{ name:"Николаева И.С.", phone:"+7 (925) 456-78-90" },
+    files:[{ name:"КП_Горизонт_final.pdf", type:"kp" },{ name:"Договор_проект.docx", type:"contract" },{ name:"ТЗ_офис.pdf", type:"tz" }],
+    tags:["contract","vip"], status:"pending", blocksSlot:true, comment:"" },
+
+  { id:4, type:"call", timeStart:"15:00", timeEnd:"16:00",
+    dealId:"70358", dealTitle:"Петров А.Н. — частный дом",
+    action:"ОС по КП", priority:"high", stage:"KP_SENT",
+    amount:520000, daysInCycle:19,
+    lastTouch:"20.05 — Повторно отправили КП со скидкой 5%. Обещал ответить в течение недели.",
+    contact:{ name:"Петров А.Н.", phone:"+7 (977) 567-89-01" },
+    files:[{ name:"КП_Петров_v3.pdf", type:"kp" }],
+    tags:["negotiat"], status:"pending", blocksSlot:false, comment:"" },
+
+  { id:5, type:"call", timeStart:"17:00", timeEnd:"18:00",
+    dealId:"71304", dealTitle:"ООО СтройПрофи — склад",
+    action:"узнать как дела", priority:"low", stage:"PREPARATION",
+    amount:0, daysInCycle:5,
+    lastTouch:"24.05 — Первый контакт. Замер назначен на 30.05.",
+    contact:{ name:"Ткачёв В.В.", phone:"+7 (906) 678-90-12" },
+    files:[],
+    tags:[], status:"pending", blocksSlot:false, comment:"" },
+];
+
+const DEMO_QUEUE = [
+  { id:101, type:"task", dealId:"74100", dealTitle:"Иванова Е. — студия",
+    action:"уточнить размеры и отправить КП", priority:"medium", stage:"NEW",
+    amount:78000, daysInCycle:2,
+    lastTouch:"27.05 — Входящая заявка. Замер не проводили.",
+    contact:{ name:"Иванова Е.М.", phone:"+7 (911) 789-01-23" },
+    files:[], tags:[], status:"pending", blocksSlot:false, comment:"" },
+
+  { id:102, type:"task", dealId:"73990", dealTitle:"ООО ТехноПарк — 4 этажа",
+    action:"готовы на замер?", priority:"high", stage:"NEW",
+    amount:0, daysInCycle:3,
+    lastTouch:"26.05 — Лид с сайта. Не дозвонились вчера.",
+    contact:{ name:"Логинов Д.С.", phone:"+7 (926) 890-12-34" },
+    files:[], tags:["hot"], status:"pending", blocksSlot:false, comment:"" },
+];
+
+// ── UI primitives ─────────────────────────────────────────────────────────────
+function Badge({ color = "gray", children, sm }) {
+  const c = C[color] || C.gray;
+  return <span style={{ background: c.bg, color: c.text, border: `0.5px solid ${c.border}`, borderRadius: 6, padding: sm ? "1px 6px" : "2px 9px", fontSize: sm ? 10 : 11, fontWeight: 500, whiteSpace: "nowrap" }}>{children}</span>;
 }
 
-// ── ui primitives ─────────────────────────────────────────────────────────────
-function Badge({color="gray", children, sm}) {
-  const c=C[color]||C.gray;
-  return <span style={{background:c.bg,color:c.text,border:`0.5px solid ${c.border}`,borderRadius:6,padding:sm?"1px 6px":"3px 9px",fontSize:sm?10:11,fontWeight:500,whiteSpace:"nowrap"}}>{children}</span>;
-}
-function Spin({label="Загрузка…"}) {
-  return <span style={{display:"flex",alignItems:"center",gap:8,color:"var(--color-text-secondary)",fontSize:13}}>
-    <svg width="14" height="14" viewBox="0 0 14 14" style={{animation:"spin 1s linear infinite",flexShrink:0}}><style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style><circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="22 8"/></svg>{label}
+function Spin({ label = "Загрузка…" }) {
+  return <span style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-text-secondary)", fontSize: 12 }}>
+    <svg width="13" height="13" viewBox="0 0 13 13" style={{ animation: "spin 1s linear infinite", flexShrink: 0 }}>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="20 8" />
+    </svg>{label}
   </span>;
 }
-function Stat({label,value,color="gray",note}) {
-  return <div style={{background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",padding:"10px 14px",flex:1,minWidth:100}}>
-    <p style={{margin:0,fontSize:11,color:"var(--color-text-secondary)",marginBottom:2}}>{label}</p>
-    <p style={{margin:0,fontSize:20,fontWeight:500,color:C[color].text}}>{value}</p>
-    {note&&<p style={{margin:0,fontSize:10,color:"var(--color-text-tertiary)",marginTop:2}}>{note}</p>}
-  </div>;
-}
-function Err({msg}) {
-  return <div style={{background:C.red.bg,border:`0.5px solid ${C.red.border}`,borderRadius:"var(--border-radius-md)",padding:"10px 14px",marginBottom:12}}>
-    <p style={{margin:0,fontSize:12,color:C.red.text}}>⚠ {msg}</p>
-  </div>;
-}
-function Tab({tabs,active,onChange}) {
-  return <div style={{display:"flex",gap:0,borderBottom:"0.5px solid var(--color-border-tertiary)",marginBottom:16,flexWrap:"wrap"}}>
-    {tabs.map(t=><button key={t.id} onClick={()=>onChange(t.id)} style={{background:"transparent",border:"none",padding:"7px 14px",fontSize:12,cursor:"pointer",color:active===t.id?"var(--color-text-primary)":"var(--color-text-secondary)",borderBottom:active===t.id?"2px solid var(--color-text-primary)":"2px solid transparent",fontWeight:active===t.id?500:400}}>{t.label}{t.dot?" ●":""}</button>)}
-  </div>;
-}
 
-// ── task card ─────────────────────────────────────────────────────────────────
-function TaskCard({task, onStatusChange, onComment, statusChanging, busy}) {
-  const [showComment,setShowComment]=useState(false);
-  const [comment,setComment]=useState("");
-  const overdue = task.deadline && isOverdue(task.deadline);
-  const done = task.status===5;
-  const borderColor = done ? C.green.border : overdue ? C.red.border : "var(--color-border-tertiary)";
-
-  return <div style={{background:"var(--color-background-primary)",border:`0.5px solid ${borderColor}`,borderRadius:"var(--border-radius-lg)",padding:"12px 14px",marginBottom:8}}>
-    <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
-      <button
-        onClick={()=>!done&&!busy&&onStatusChange(task.id, done?3:5)}
-        disabled={busy||done}
-        style={{marginTop:2,width:18,height:18,borderRadius:"50%",border:`1.5px solid ${done?C.green.border:C.gray.border}`,background:done?C.green.bg:"transparent",cursor:done?"default":"pointer",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:C.green.text}}
-        title={done?"Завершена":"Отметить выполненной"}
-        aria-label="Изменить статус задачи"
-      >{done?"✓":""}</button>
-      <div style={{flex:1}}>
-        <p style={{margin:"0 0 4px",fontSize:13,fontWeight:500,color:done?"var(--color-text-tertiary)":"var(--color-text-primary)",textDecoration:done?"line-through":"none"}}>{task.title}</p>
-        <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
-          {task.deal&&<Badge color="purple" sm>{task.deal}</Badge>}
-          {task.deadline&&<Badge color={overdue?"red":done?"green":"gray"} sm>{overdue?"Просрочено: ":""}{task.deadline}</Badge>}
-          <Badge color={done?"green":task.status===3?"teal":"gray"} sm>{TASK_STATUS[task.status]||"—"}</Badge>
-          {task.priority==="high"&&!done&&<Badge color="coral" sm>срочно</Badge>}
-        </div>
-        {task.description&&<p style={{margin:"6px 0 0",fontSize:12,color:"var(--color-text-secondary)"}}>{task.description}</p>}
-      </div>
-      {!done&&<button onClick={()=>setShowComment(v=>!v)} style={{fontSize:11,padding:"4px 10px",flexShrink:0}} aria-label="Добавить результат">
-        {showComment?"Закрыть":"Результат"}
-      </button>}
-    </div>
-
-    {statusChanging===task.id&&<div style={{marginTop:8}}><Spin label="Обновляем в Bitrix24…"/></div>}
-
-    {showComment&&!done&&<div style={{marginTop:10,borderTop:"0.5px solid var(--color-border-tertiary)",paddingTop:10}}>
-      <p style={{margin:"0 0 6px",fontSize:11,color:"var(--color-text-secondary)"}}>Результат / комментарий к задаче</p>
-      <textarea
-        value={comment} onChange={e=>setComment(e.target.value)}
-        placeholder="Что сделано? Какой результат? Прикрепи скрины в Bitrix24 нативно."
-        style={{width:"100%",minHeight:70,fontSize:12,padding:8,borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",background:"var(--color-background-secondary)",color:"var(--color-text-primary)",resize:"vertical",boxSizing:"border-box"}}
-      />
-      <div style={{display:"flex",gap:8,marginTop:6,justifyContent:"flex-end"}}>
-        <button onClick={()=>{setShowComment(false);setComment("");}} style={{fontSize:11,padding:"5px 12px"}}>Отмена</button>
-        <button onClick={()=>{onComment(task.id,comment);setShowComment(false);setComment("");}} disabled={!comment.trim()||busy} style={{fontSize:11,padding:"5px 12px"}} aria-label="Сохранить результат">Сохранить + завершить ↗</button>
-      </div>
-    </div>}
-  </div>;
-}
-
-// ── ai-generated task proposal ────────────────────────────────────────────────
-function AITaskProposal({proposal, onApprove, onReject, busy}) {
-  return <div style={{background:C.purple.bg,border:`0.5px solid ${C.purple.border}`,borderRadius:"var(--border-radius-lg)",padding:"12px 14px",marginBottom:8}}>
-    <div style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:6}}>
-      <span style={{fontSize:10,background:C.purple.bg,color:C.purple.text,border:`0.5px solid ${C.purple.border}`,borderRadius:4,padding:"2px 6px",flexShrink:0}}>ИИ</span>
-      <p style={{margin:0,fontSize:13,fontWeight:500,color:C.purple.text}}>{proposal.title}</p>
-    </div>
-    {proposal.description&&<p style={{margin:"0 0 6px",fontSize:12,color:C.purple.text,opacity:0.8}}>{proposal.description}</p>}
-    <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
-      {proposal.deadline&&<Badge color="purple" sm>📅 {proposal.deadline}</Badge>}
-      {proposal.priority&&<Badge color={proposal.priority==="high"?"coral":"amber"} sm>{proposal.priority==="high"?"срочно":"обычный"}</Badge>}
-      <div style={{flex:1}}/>
-      <button onClick={()=>onReject(proposal)} style={{fontSize:11,padding:"4px 10px"}} disabled={busy}>Отклонить</button>
-      <button onClick={()=>onApprove(proposal)} style={{fontSize:11,padding:"4px 10px"}} disabled={busy}>Создать ↗</button>
-    </div>
-  </div>;
-}
-
-// ── main app ──────────────────────────────────────────────────────────────────
-export default function App() {
-  const [mode, setMode] = useState("admin"); // admin | employee
-  const [users, setUsers] = useState([]);
-  const [selectedUser, setSelectedUser] = useState(null);
-  const [deals, setDeals] = useState([]);
-  const [tasks, setTasks] = useState([]);
-  const [overdueTasks, setOverdueTasks] = useState([]);
-  const [aiProposals, setAiProposals] = useState([]);
-  const [report, setReport] = useState(null);
-  const [tab, setTab] = useState("tasks");
-  const [loading, setLoading] = useState(false);
-  const [loadMsg, setLoadMsg] = useState("");
-  const [statusChanging, setStatusChanging] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [errors, setErrors] = useState([]);
-  const [generatingTasks, setGeneratingTasks] = useState(false);
-  const [selectedDealForAI, setSelectedDealForAI] = useState(null);
-  const [generatingReport, setGeneratingReport] = useState(false);
-  const convHistory = useRef([]);
-
-  const addError = (msg) => setErrors(e=>[...e.slice(-2), msg]);
-  const clearErrors = () => setErrors([]);
-
-  // ── load users list (admin) ──────────────────────────────────────────────
-  const loadUsers = useCallback(async () => {
-    setLoading(true); setLoadMsg("Загружаем сотрудников…"); clearErrors();
-    try {
-      const res = await callClaude(
-        "Получи список всех пользователей Bitrix24 через user.get или user.search. Верни JSON массив: [{id, name, position, active}]",
-        "Ты интеграция Bitrix24. Используй MCP. Отвечай ТОЛЬКО JSON без markdown."
-      );
-      const text = extractText(res.content);
-      const parsed = parseArr(text) || parseJSON(text)?.users;
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        setUsers(parsed);
-      } else {
-        // fallback demo users
-        setUsers([
-          {id:1, name:"Алексей Иванов", position:"Менеджер по продажам", active:true},
-          {id:2, name:"Мария Петрова", position:"Старший менеджер", active:true},
-          {id:3, name:"Кирилл Сидоров", position:"Менеджер", active:true},
-        ]);
-      }
-    } catch(e) { addError(e.message); setUsers([{id:1,name:"Алексей Иванов",position:"Менеджер",active:true}]); }
-    finally { setLoading(false); setLoadMsg(""); }
-  }, []);
-
-  // ── load data for selected user ──────────────────────────────────────────
-  const loadUserData = useCallback(async (user) => {
-    setLoading(true); setLoadMsg("Загружаем сделки…"); clearErrors();
-    setDeals([]); setTasks([]); setOverdueTasks([]); setAiProposals([]); setReport(null);
-    convHistory.current = [];
-
-    try {
-      // Step 1: deals
-      const today = new Date().toISOString().split("T")[0];
-      const dealRes = await callClaude(
-        `Получи сделки из Bitrix24 где ASSIGNED_BY_ID = ${user.id}. Используй crm.deal.list с фильтром ASSIGNED_BY_ID=${user.id}. Верни JSON: {deals:[{id,title,stage_id,opportunity,currency_id,contact_name,date_modify,activities_count}]}`,
-        "Bitrix24 MCP интеграция. ТОЛЬКО JSON без markdown."
-      );
-      const dealText = extractText(dealRes.content);
-      const dealData = parseJSON(dealText);
-      const dealsArr = dealData?.deals || [];
-      setDeals(dealsArr);
-      convHistory.current.push({role:"user",content:`Сделки пользователя: ${JSON.stringify(dealsArr)}`},{role:"assistant",content:"Данные о сделках получены."});
-
-      // Step 2: tasks
-      setLoadMsg("Загружаем задачи…");
-      const taskRes = await callClaude(
-        `Получи задачи из Bitrix24 для пользователя ID=${user.id} (RESPONSIBLE_ID=${user.id}). Используй tasks.task.list. Верни JSON: {tasks:[{id,title,status,priority,deadline,uf_crm_task,description,createdBy}]}`,
-        "Bitrix24 MCP. ТОЛЬКО JSON без markdown."
-      );
-      const taskText = extractText(taskRes.content);
-      const taskData = parseJSON(taskText);
-      const allTasks = (taskData?.tasks || []).map(t=>({
-        ...t,
-        deal: t.uf_crm_task?.[0]?.replace("D_",""):"",
-        deadline: t.deadline ? new Date(t.deadline).toLocaleDateString("ru-RU") : null,
-        priority: t.priority>0?"high":"medium",
-      }));
-
-      // Separate overdue vs active
-      const active = allTasks.filter(t => t.status!==5 && isTodayOrFuture(t.deadline));
-      const overdue = allTasks.filter(t => t.status!==5 && t.deadline && isOverdue(t.deadline));
-      setTasks(active);
-      setOverdueTasks(overdue);
-
-    } catch(e) {
-      addError(e.message);
-      // fallback demo
-      const today = todayStr(), tmr = tomorrowStr();
-      setDeals([
-        {id:101,title:"ООО Техстрой — оборудование",stage_id:"EXECUTING",opportunity:1850000,currency_id:"RUB",contact_name:"Морозов А.В."},
-        {id:102,title:"Строй-Инвест — тендер",stage_id:"PREPARATION",opportunity:5600000,currency_id:"RUB",contact_name:"Алексеев К."},
-        {id:103,title:"ИП Смирнов — консалтинг",stage_id:"NEW",opportunity:480000,currency_id:"RUB",contact_name:"Смирнов П."},
-      ]);
-      setTasks([
-        {id:201,title:"Отправить КП в Техстрой",status:3,priority:"high",deadline:today,deal:"Техстрой",description:""},
-        {id:202,title:"Согласовать договор Строй-Инвест",status:1,priority:"high",deadline:tmr,deal:"Строй-Инвест",description:""},
-        {id:203,title:"Звонок Смирнову 15:00",status:1,priority:"medium",deadline:today,deal:"Смирнов",description:""},
-      ]);
-      setOverdueTasks([
-        {id:200,title:"Обновить контакт в Строй-Инвест",status:1,priority:"medium",deadline:"27.05.2025",deal:"Строй-Инвест",description:""},
-      ]);
-    }
-    setLoading(false); setLoadMsg("");
-  }, []);
-
-  // ── status change write-back ─────────────────────────────────────────────
-  const changeTaskStatus = useCallback(async (taskId, newStatus) => {
-    setStatusChanging(taskId);
-    try {
-      await callClaude(
-        `Обнови статус задачи ID=${taskId} в Bitrix24 на STATUS=${newStatus}. Используй tasks.task.update с полями {id:${taskId}, fields:{STATUS:${newStatus}}}. Верни просто "ok".`,
-        "Bitrix24 MCP. Выполни операцию обновления задачи."
-      );
-      setTasks(ts=>ts.map(t=>t.id===taskId?{...t,status:newStatus}:t));
-      if (newStatus===5) setTasks(ts=>ts.filter(t=>t.id!==taskId)); // remove from active
-    } catch(e) {
-      addError(`Не удалось обновить задачу: ${e.message}`);
-      // optimistic update anyway for demo
-      setTasks(ts=>newStatus===5 ? ts.filter(t=>t.id!==taskId) : ts.map(t=>t.id===taskId?{...t,status:newStatus}:t));
-    }
-    setStatusChanging(null);
-  }, []);
-
-  // ── add comment + close task ─────────────────────────────────────────────
-  const submitComment = useCallback(async (taskId, commentText) => {
-    setBusy(true);
-    try {
-      await callClaude(
-        `Добавь комментарий к задаче ID=${taskId} в Bitrix24 через task.comment.add: {taskId:${taskId}, fields:{POST_MESSAGE:"${commentText.replace(/"/g,"'")}"}}, затем обнови статус задачи на 5 (завершена) через tasks.task.update{id:${taskId}, fields:{STATUS:5}}. Верни "ok".`,
-        "Bitrix24 MCP. Выполни последовательно: добавить комментарий, затем закрыть задачу."
-      );
-      setTasks(ts=>ts.filter(t=>t.id!==taskId));
-    } catch(e) {
-      addError(`Комментарий: ${e.message}`);
-      setTasks(ts=>ts.filter(t=>t.id!==taskId));
-    }
-    setBusy(false);
-  }, []);
-
-  // ── reschedule overdue ───────────────────────────────────────────────────
-  const rescheduleOverdue = useCallback(async (taskId) => {
-    setBusy(true);
-    const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate()+1);
-    const iso = tomorrow.toISOString();
-    try {
-      await callClaude(
-        `Перенеси дедлайн задачи ID=${taskId} на завтра (${iso}) в Bitrix24 через tasks.task.update{id:${taskId}, fields:{DEADLINE:"${iso}"}}. Верни "ok".`,
-        "Bitrix24 MCP. Обнови дедлайн задачи."
-      );
-      setOverdueTasks(ts=>ts.filter(t=>t.id!==taskId));
-      setTasks(ts=>[...ts, ...overdueTasks.filter(t=>t.id===taskId).map(t=>({...t,deadline:tomorrowStr()}))]);
-    } catch(e) {
-      addError(`Перенос: ${e.message}`);
-      const t = overdueTasks.find(t=>t.id===taskId);
-      if (t) { setOverdueTasks(ts=>ts.filter(x=>x.id!==taskId)); setTasks(ts=>[...ts,{...t,deadline:tomorrowStr()}]); }
-    }
-    setBusy(false);
-  }, [overdueTasks]);
-
-  // ── ai generate tasks for deal ───────────────────────────────────────────
-  const generateTasksForDeal = useCallback(async (deal) => {
-    setGeneratingTasks(true); setAiProposals([]);
-    try {
-      const res = await callClaude(
-        `Проанализируй сделку и создай конкретные задачи для менеджера.
-Сделка: ${JSON.stringify(deal)}
-Существующие задачи по этой сделке: ${JSON.stringify(tasks.filter(t=>t.deal&&deal.title?.toLowerCase().includes(t.deal.toLowerCase())))}
-
-Правила:
-- Только задачи, которые реально нужны для продвижения сделки
-- Дедлайны: конкретные даты (сегодня, завтра, +2 дня, +5 дней)
-- Не дублируй существующие задачи
-- Максимум 4 задачи
-
-Верни JSON массив: [{title, description, deadline, priority, reason}]
-где priority = "high" | "medium", deadline = "DD.MM.YYYY"`,
-        "Ты жёсткий CRM-аналитик. Генерируй только реально нужные задачи. ТОЛЬКО JSON массив без markdown."
-      );
-      const text = extractText(res.content);
-      const proposals = parseArr(text);
-      if (Array.isArray(proposals)) setAiProposals(proposals.map((p,i)=>({...p,_id:`ai_${Date.now()}_${i}`})));
-    } catch(e) {
-      addError(`ИИ-агент: ${e.message}`);
-      setAiProposals([
-        {_id:"ai_1",title:`Подготовить КП для ${deal.title}`,description:"Персонализированное коммерческое предложение",deadline:todayStr(),priority:"high",reason:"Сделка в активной стадии — нужен КП"},
-        {_id:"ai_2",title:`Созвон с контактом по ${deal.title}`,description:"Уточнить потребности и возражения",deadline:tomorrowStr(),priority:"medium",reason:"Нет активностей за последние дни"},
-      ]);
-    }
-    setGeneratingTasks(false);
-  }, [tasks]);
-
-  const approveAITask = useCallback(async (proposal) => {
-    setBusy(true);
-    try {
-      const deadlineISO = proposal.deadline ? (() => {
-        const [d,m,y]=proposal.deadline.split(".");
-        return new Date(y,m-1,d).toISOString();
-      })() : null;
-      await callClaude(
-        `Создай задачу в Bitrix24 через tasks.task.add: {fields:{TITLE:"${proposal.title}",DESCRIPTION:"${proposal.description||""}",RESPONSIBLE_ID:${selectedUser?.id||1},PRIORITY:${proposal.priority==="high"?2:1}${deadlineISO?`,DEADLINE:"${deadlineISO}"`:""}}}}. Верни "ok".`,
-        "Bitrix24 MCP. Создай задачу."
-      );
-      setAiProposals(p=>p.filter(x=>x._id!==proposal._id));
-      setTasks(ts=>[...ts, {id:Date.now(),title:proposal.title,description:proposal.description,status:1,priority:proposal.priority,deadline:proposal.deadline,deal:selectedDealForAI?.title||""}]);
-    } catch(e) {
-      addError(`Создание задачи: ${e.message}`);
-      setAiProposals(p=>p.filter(x=>x._id!==proposal._id));
-      setTasks(ts=>[...ts, {id:Date.now(),title:proposal.title,description:proposal.description,status:1,priority:proposal.priority,deadline:proposal.deadline,deal:selectedDealForAI?.title||""}]);
-    }
-    setBusy(false);
-  }, [selectedUser, selectedDealForAI]);
-
-  const rejectAITask = useCallback((proposal) => {
-    setAiProposals(p=>p.filter(x=>x._id!==proposal._id));
-  }, []);
-
-  // ── generate daily report ────────────────────────────────────────────────
-  const generateReport = useCallback(async () => {
-    setGeneratingReport(true); setReport(null);
-    try {
-      const completedToday = tasks.filter(t=>t.status===5); // in real app, filter by completion date
-      const res = await callClaude(
-        `Составь ежедневный отчёт менеджера ${selectedUser?.name} за ${todayStr()}.
-Данные:
-- Активные задачи: ${JSON.stringify(tasks)}
-- Просроченные: ${JSON.stringify(overdueTasks)}
-- Сделки: ${JSON.stringify(deals)}
-
-Требования к отчёту:
-- Что сделано сегодня
-- Что не сделано и почему (риски)
-- Ключевые сделки в работе
-- Что нужно сделать завтра (топ-3)
-- Общая оценка продуктивности (1-10)
-
-Верни JSON: {summary, done_count, pending_count, overdue_count, risks:[{deal,risk}], tomorrow:[{action}], score, score_comment}`,
-        "Ты строгий руководитель отдела продаж. Отчёт должен быть честным и конкретным. ТОЛЬКО JSON без markdown."
-      );
-      const text = extractText(res.content);
-      const parsed = parseJSON(text);
-      setReport(parsed || {
-        summary:`${selectedUser?.name} — рабочий день ${todayStr()}. В работе ${tasks.length} задач, ${overdueTasks.length} просроченных.`,
-        done_count:0, pending_count:tasks.length, overdue_count:overdueTasks.length,
-        risks:overdueTasks.map(t=>({deal:t.deal||"—",risk:t.title})),
-        tomorrow:tasks.filter(t=>t.priority==="high").slice(0,3).map(t=>({action:t.title})),
-        score:overdueTasks.length>0?5:7,
-        score_comment:overdueTasks.length>0?"Есть просроченные задачи — требует внимания":"Задачи в норме"
-      });
-    } catch(e) { addError(`Отчёт: ${e.message}`); }
-    setGeneratingReport(false);
-  }, [tasks, overdueTasks, deals, selectedUser]);
-
-  // ── computed ─────────────────────────────────────────────────────────────
-  const todayTasks = tasks.filter(t=>t.deadline===todayStr());
-  const futureTasks = tasks.filter(t=>!t.deadline||t.deadline!==todayStr());
-  const hasData = deals.length>0 || tasks.length>0;
-
-  const TABS = [
-    {id:"tasks", label:`Задачи (${tasks.length})`, dot:overdueTasks.length>0},
-    {id:"deals", label:`Сделки (${deals.length})`},
-    {id:"ai", label:"ИИ-агент", dot:aiProposals.length>0},
-    {id:"report", label:"Отчёт дня", dot:!!report},
-  ];
-
-  // ── render ────────────────────────────────────────────────────────────────
+// ── Mini time grid ─────────────────────────────────────────────────────────────
+function MiniGrid({ tasks }) {
   return (
-    <div style={{padding:"0 0 2rem"}}>
-      <h2 className="sr-only">Bitrix24 AI-воркспейс</h2>
+    <div style={{ marginBottom: 14 }}>
+      <p style={{ margin: "0 0 5px", fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.07em" }}>Расписание {todayStr()}</p>
+      <div style={{ display: "flex", gap: 2 }}>
+        {HOURS.map(h => {
+          const meeting = tasks.find(t => t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
+          const call = !meeting && tasks.find(t => !t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
+          const done = !meeting && !call && tasks.find(t => t.status === "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
+          const bg = meeting ? C.purple.bg : call ? C.blue.bg : done ? C.green.bg : "var(--color-background-secondary)";
+          const bc = meeting ? C.purple.border : call ? C.blue.border : done ? C.green.border : "var(--color-border-tertiary)";
+          const tc = meeting ? C.purple.text : call ? C.blue.text : done ? C.green.text : "var(--color-text-tertiary)";
+          return (
+            <div key={h} style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ height: 18, background: bg, border: `0.5px solid ${bc}`, borderRadius: 3, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {meeting && <i className="ti ti-users" style={{ fontSize: 8, color: C.purple.text }} aria-hidden="true" />}
+                {call && <i className="ti ti-phone" style={{ fontSize: 8, color: C.blue.text }} aria-hidden="true" />}
+                {done && <i className="ti ti-check" style={{ fontSize: 8, color: C.green.text }} aria-hidden="true" />}
+              </div>
+              <span style={{ fontSize: 8, color: tc }}>{h}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 10, marginTop: 5, fontSize: 9, color: "var(--color-text-tertiary)" }}>
+        {[["Встреча (блок)", C.purple], ["Звонок", C.blue], ["Выполнено", C.green]].map(([l, c]) => (
+          <span key={l} style={{ display: "flex", alignItems: "center", gap: 3 }}>
+            <span style={{ width: 7, height: 7, borderRadius: 2, background: c.bg, border: `0.5px solid ${c.border}`, display: "inline-block" }} />{l}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-      {/* Header */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
-        <div>
-          <p style={{margin:0,fontSize:10,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.08em"}}>AI воркспейс</p>
-          <h2 style={{margin:0,fontSize:18,fontWeight:500}}>Bitrix24</h2>
+// ── Deal preview (expanded) ───────────────────────────────────────────────────
+function DealPreview({ task }) {
+  const si = STAGES[task.stage] || { label: task.stage || "—", color: "gray" };
+  const cc = task.daysInCycle < AVG_CYCLE * 0.6 ? "green" : task.daysInCycle < AVG_CYCLE ? "amber" : "red";
+  const cyclePct = Math.min(100, Math.round(task.daysInCycle / (AVG_CYCLE * 1.5) * 100));
+
+  return (
+    <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 10, marginTop: 8 }}>
+
+      {/* Stats row */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", minWidth: 80 }}>
+          <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Сумма</p>
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 500, color: task.amount > 0 ? C.teal.text : "var(--color-text-tertiary)" }}>
+            {task.amount > 0 ? Number(task.amount).toLocaleString("ru") + " ₽" : "Не указана"}
+          </p>
         </div>
-        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-          <div style={{display:"flex",borderRadius:"var(--border-radius-md)",overflow:"hidden",border:"0.5px solid var(--color-border-secondary)"}}>
-            {["admin","employee"].map(m=>(
-              <button key={m} onClick={()=>setMode(m)} style={{fontSize:11,padding:"5px 12px",background:mode===m?"var(--color-background-secondary)":"transparent",border:"none",cursor:"pointer",fontWeight:mode===m?500:400}}>
-                {m==="admin"?"👤 Администратор":"🧑‍💼 Сотрудник"}
-              </button>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", minWidth: 80 }}>
+          <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Цикл сделки</p>
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 500, color: C[cc].text }}>{task.daysInCycle} дн.</p>
+          <div style={{ height: 3, background: "var(--color-border-tertiary)", borderRadius: 2, marginTop: 3 }}>
+            <div style={{ height: "100%", width: `${cyclePct}%`, background: C[cc].border, borderRadius: 2 }} />
+          </div>
+        </div>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "6px 10px", flex: 1, minWidth: 100 }}>
+          <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>Стадия</p>
+          <div style={{ marginTop: 3 }}><Badge color={si.color} sm>{si.label}</Badge></div>
+        </div>
+      </div>
+
+      {/* Last touch */}
+      {task.lastTouch && (
+        <div style={{ background: C.amber.bg, border: `0.5px solid ${C.amber.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 8 }}>
+          <p style={{ margin: "0 0 2px", fontSize: 9, color: C.amber.text, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 }}>Последнее касание</p>
+          <p style={{ margin: 0, fontSize: 12, color: C.amber.text }}>{task.lastTouch}</p>
+        </div>
+      )}
+
+      {/* Files */}
+      {task.files?.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <p style={{ margin: "0 0 4px", fontSize: 9, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Файлы</p>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            {task.files.map((f, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 6, padding: "2px 8px" }}>
+                <Badge color={FILE_COLOR[f.type] || "gray"} sm>{FILE_LABEL[f.type] || "Файл"}</Badge>
+                <span style={{ fontSize: 11, color: "var(--color-text-primary)" }}>{f.name}</span>
+              </div>
             ))}
           </div>
-          {mode==="admin"&&(
-            users.length===0
-              ? <button onClick={loadUsers} disabled={loading} style={{fontSize:11,padding:"5px 12px"}}>Загрузить сотрудников ↗</button>
-              : <select onChange={e=>{const u=users.find(x=>String(x.id)===e.target.value);setSelectedUser(u);if(u)loadUserData(u);}} style={{fontSize:12,padding:"5px 10px",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)"}}>
-                  <option value="">— выбрать сотрудника —</option>
-                  {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
-                </select>
-          )}
-          {mode==="employee"&&!selectedUser&&(
-            <button onClick={()=>{ loadUsers().then(()=>{}); }} style={{fontSize:11,padding:"5px 12px"}}>Войти ↗</button>
-          )}
-          {hasData&&<button onClick={()=>selectedUser&&loadUserData(selectedUser)} disabled={loading} style={{fontSize:11,padding:"5px 12px"}}>↻</button>}
+        </div>
+      )}
+
+      {/* Contact actions */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ flex: 1 }}>
+          <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{task.contact.name}</p>
+          <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{task.contact.phone}</p>
+        </div>
+        <a href={`tel:${task.contact.phone}`} style={{ textDecoration: "none" }}>
+          <button style={{ fontSize: 11, padding: "4px 10px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Позвонить">
+            <i className="ti ti-phone" style={{ fontSize: 11 }} aria-hidden="true" /> Позвонить
+          </button>
+        </a>
+        <button style={{ fontSize: 11, padding: "4px 10px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Открытая линия">
+          <i className="ti ti-message" style={{ fontSize: 11 }} aria-hidden="true" /> Написать
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Inline tag picker ─────────────────────────────────────────────────────────
+function TagRow({ selected, onChange }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+        {selected.map(tid => {
+          const t = TAG_PRESETS.find(x => x.id === tid);
+          return t ? <span key={tid} onClick={() => onChange(selected.filter(x => x !== tid))} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 4, padding: "1px 7px", fontSize: 10, fontWeight: 500, cursor: "pointer" }} title="Убрать тег">{t.label} ×</span> : null;
+        })}
+        <button onClick={() => setOpen(o => !o)} style={{ fontSize: 10, padding: "2px 8px" }} aria-label="Управление тегами">
+          <i className="ti ti-tag" style={{ fontSize: 10 }} aria-hidden="true" /> {open ? "Закрыть" : "Теги"}
+        </button>
+      </div>
+      {open && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 5, padding: "6px 8px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-tertiary)" }}>
+          {TAG_PRESETS.map(tag => {
+            const active = selected.includes(tag.id);
+            return <span key={tag.id} onClick={() => { onChange(active ? selected.filter(x => x !== tag.id) : [...selected, tag.id]); }} style={{ background: active ? tag.bg : "transparent", color: active ? tag.color : "var(--color-text-secondary)", border: `0.5px solid ${active ? tag.color : "var(--color-border-tertiary)"}`, borderRadius: 4, padding: "2px 8px", fontSize: 10, cursor: "pointer", fontWeight: active ? 500 : 400 }}>{tag.label}</span>;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Reschedule form ───────────────────────────────────────────────────────────
+function RescheduleForm({ task, allTasks, onSave, onCancel }) {
+  const [date, setDate] = useState("");
+  const [time, setTime] = useState("");
+  const [comment, setComment] = useState("");
+
+  const slotBlocked = time && allTasks.some(t => t.id !== task.id && t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= toMins(time) && toMins(t.timeEnd) > toMins(time));
+  const valid = comment.trim().length >= 5 && date && !slotBlocked;
+
+  return (
+    <div style={{ marginTop: 8, padding: 10, background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-tertiary)" }}>
+      <p style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 500 }}>Перенести дело</p>
+      <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+        <div style={{ flex: 1 }}>
+          <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>Новая дата <span style={{ color: "var(--color-text-danger)" }}>*</span></label>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ width: "100%", fontSize: 12, padding: "5px 8px", boxSizing: "border-box" }} />
+        </div>
+        {!task.blocksSlot && (
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>Время</label>
+            <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ width: "100%", fontSize: 12, padding: "5px 8px", boxSizing: "border-box" }} />
+          </div>
+        )}
+      </div>
+      {slotBlocked && <p style={{ margin: "0 0 6px", fontSize: 11, color: C.red.text }}>⚠ Это время занято встречей — выберите другое</p>}
+      <div style={{ marginBottom: 6 }}>
+        <label style={{ fontSize: 10, color: "var(--color-text-secondary)", display: "block", marginBottom: 2 }}>
+          Результат касания + причина переноса <span style={{ color: "var(--color-text-danger)" }}>*</span>
+        </label>
+        <textarea value={comment} onChange={e => setComment(e.target.value)} placeholder="Обязательно: что произошло? О чём говорили? Почему переносим?" style={{ width: "100%", minHeight: 55, fontSize: 12, padding: 7, boxSizing: "border-box", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical" }} />
+        {comment.trim().length > 0 && comment.trim().length < 5 && <p style={{ margin: "2px 0 0", fontSize: 10, color: "var(--color-text-secondary)" }}>Слишком коротко</p>}
+      </div>
+      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+        <button onClick={onCancel} style={{ fontSize: 11, padding: "4px 12px" }}>Отмена</button>
+        <button onClick={() => valid && onSave({ date, time, comment })} disabled={!valid} style={{ fontSize: 11, padding: "4px 12px" }} aria-label="Сохранить перенос">Перенести ↗</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Complete form ─────────────────────────────────────────────────────────────
+function CompleteForm({ onSave, onCancel }) {
+  const [result, setResult] = useState("done");
+  const [comment, setComment] = useState("");
+  const valid = comment.trim().length >= 5;
+
+  return (
+    <div style={{ marginTop: 8, padding: 10, background: C.green.bg, borderRadius: "var(--border-radius-md)", border: `0.5px solid ${C.green.border}` }}>
+      <p style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 500, color: C.green.text }}>Результат</p>
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+        {RESULT_OPTS.map(r => (
+          <button key={r.id} onClick={() => setResult(r.id)} style={{ fontSize: 11, padding: "3px 10px", background: result === r.id ? C[r.color].bg : "transparent", border: result === r.id ? `1.5px solid ${C[r.color].border}` : "0.5px solid var(--color-border-secondary)", borderRadius: 6, cursor: "pointer", color: result === r.id ? C[r.color].text : "var(--color-text-secondary)", fontWeight: result === r.id ? 500 : 400 }}>{r.label}</button>
+        ))}
+      </div>
+      <textarea value={comment} onChange={e => setComment(e.target.value)} placeholder="Что обсудили? О чём договорились? Следующий шаг?" style={{ width: "100%", minHeight: 50, fontSize: 12, padding: 7, boxSizing: "border-box", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical", marginBottom: 6 }} />
+      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+        <button onClick={onCancel} style={{ fontSize: 11, padding: "4px 12px" }}>Отмена</button>
+        <button onClick={() => valid && onSave({ result, comment })} disabled={!valid} style={{ fontSize: 11, padding: "4px 12px" }} aria-label="Сохранить результат">Сохранить ↗</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Task card ─────────────────────────────────────────────────────────────────
+function TaskCard({ task, allTasks, onUpdate, onComplete, onReschedule, isQueue }) {
+  const [expanded, setExpanded] = useState(false);
+  const [mode, setMode] = useState(null); // null | "complete" | "reschedule"
+  const done = task.status === "done";
+  const rescheduled = task.status === "rescheduled";
+
+  const border = done
+    ? "var(--color-border-tertiary)"
+    : task.blocksSlot
+    ? C.purple.border
+    : task.priority === "high"
+    ? C.coral.border
+    : "var(--color-border-tertiary)";
+
+  const bg = done
+    ? "var(--color-background-secondary)"
+    : task.blocksSlot
+    ? C.purple.bg
+    : "var(--color-background-primary)";
+
+  const toggle = () => { if (mode) return; setExpanded(e => !e); };
+  const setModeAndExpand = (m) => { setMode(m); setExpanded(true); };
+
+  return (
+    <div style={{ border: `0.5px solid ${border}`, background: bg, borderRadius: "var(--border-radius-lg)", marginBottom: 5, overflow: "hidden" }}>
+
+      {/* Row */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 11px", cursor: "pointer" }} onClick={toggle}>
+
+        {/* Time OR type icon */}
+        {!isQueue ? (
+          <div style={{ flexShrink: 0, textAlign: "center", minWidth: 50 }}>
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 500, color: done ? "var(--color-text-tertiary)" : task.blocksSlot ? C.purple.text : C.blue.text, lineHeight: 1.2 }}>{task.timeStart}</p>
+            <p style={{ margin: 0, fontSize: 9, color: "var(--color-text-tertiary)" }}>— {task.timeEnd}</p>
+          </div>
+        ) : (
+          <div style={{ flexShrink: 0, width: 26, height: 26, borderRadius: "50%", background: C.blue.bg, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <i className={`ti ${task.type === "call" ? "ti-phone" : task.type === "meeting" ? "ti-users" : "ti-check"}`} style={{ fontSize: 11, color: C.blue.text }} aria-hidden="true" />
+          </div>
+        )}
+
+        {/* Content */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 2, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, fontWeight: 500, color: done ? "var(--color-text-tertiary)" : "var(--color-text-primary)", textDecoration: done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>{task.dealTitle}</span>
+            {task.blocksSlot && <Badge color="purple" sm>встреча ⛔</Badge>}
+            {task.priority === "high" && !done && <Badge color="coral" sm>срочно</Badge>}
+          </div>
+          <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>#{task.dealId}</span>
+            <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>→ {task.action}</span>
+            {task.tags.map(tid => { const t = TAG_PRESETS.find(x => x.id === tid); return t ? <span key={tid} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 3, padding: "0 5px", fontSize: 9, fontWeight: 500 }}>{t.label}</span> : null; })}
+          </div>
+        </div>
+
+        {/* Status + chevron */}
+        <div style={{ flexShrink: 0, display: "flex", gap: 5, alignItems: "center" }}>
+          {done && <Badge color="green" sm>✓ готово</Badge>}
+          {rescheduled && <Badge color="amber" sm>перенесено</Badge>}
+          <i className={`ti ti-chevron-${expanded ? "up" : "down"}`} style={{ fontSize: 13, color: "var(--color-text-tertiary)" }} aria-hidden="true" />
         </div>
       </div>
 
-      {/* Errors */}
-      {errors.map((e,i)=><Err key={i} msg={e}/>)}
+      {/* Expanded */}
+      {expanded && (
+        <div style={{ padding: "0 11px 11px" }}>
+          {!done && <DealPreview task={task} />}
 
-      {/* Loading */}
-      {loading&&<div style={{marginBottom:16}}><Spin label={loadMsg}/></div>}
+          {done && task.comment && (
+            <div style={{ padding: "6px 10px", background: "var(--color-background-secondary)", borderRadius: 6, fontSize: 12, color: "var(--color-text-secondary)", marginTop: 4 }}>
+              {task.comment}
+            </div>
+          )}
 
-      {/* Empty state */}
-      {!hasData&&!loading&&(
-        <div style={{background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-lg)",padding:"36px 24px",textAlign:"center"}}>
-          <i className="ti ti-users" style={{fontSize:28,color:"var(--color-text-tertiary)"}} aria-hidden="true"/>
-          <p style={{margin:"10px 0 4px",fontSize:14,fontWeight:500}}>
-            {mode==="admin"?"Выберите сотрудника для просмотра воркспейса":"Авторизуйтесь для просмотра задач"}
-          </p>
-          <p style={{margin:0,fontSize:12,color:"var(--color-text-secondary)"}}>
-            {mode==="admin"
-              ?"Загрузите список сотрудников → выберите менеджера → получите полный обзор"
-              :"Войдите через аккаунт Bitrix24 для доступа к своим задачам и сделкам"}
-          </p>
+          {!done && (
+            <>
+              {/* Actions */}
+              {mode === null && (
+                <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", alignItems: "center", borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8 }}>
+                  <button onClick={() => setModeAndExpand("complete")} style={{ fontSize: 11, padding: "4px 11px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Отметить выполненным">
+                    <i className="ti ti-check" style={{ fontSize: 11 }} aria-hidden="true" /> Готово
+                  </button>
+                  <button onClick={() => setModeAndExpand("reschedule")} style={{ fontSize: 11, padding: "4px 11px", display: "flex", alignItems: "center", gap: 3 }} aria-label="Перенести">
+                    <i className="ti ti-calendar-event" style={{ fontSize: 11 }} aria-hidden="true" /> Перенести
+                  </button>
+                  <TagRow selected={task.tags} onChange={tags => onUpdate({ ...task, tags })} />
+                  <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--color-text-tertiary)" }}>цикл: {task.daysInCycle}д | сред. {AVG_CYCLE}д</span>
+                </div>
+              )}
+
+              {mode === "complete" && (
+                <CompleteForm
+                  onSave={res => { onComplete(task.id, res); setMode(null); setExpanded(false); }}
+                  onCancel={() => setMode(null)}
+                />
+              )}
+              {mode === "reschedule" && (
+                <RescheduleForm
+                  task={task} allTasks={allTasks}
+                  onSave={res => { onReschedule(task.id, res); setMode(null); setExpanded(false); }}
+                  onCancel={() => setMode(null)}
+                />
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Report tab ─────────────────────────────────────────────────────────────────
+function ReportTab({ tasks, backlog }) {
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  const done = tasks.filter(t => t.status === "done");
+  const rescheduled = tasks.filter(t => t.status === "rescheduled");
+  const pending = tasks.filter(t => t.status === "pending");
+  const pct = tasks.length > 0 ? Math.round(done.length / tasks.length * 100) : 0;
+
+  const generate = async () => {
+    setLoading(true); setErr(""); setReport(null);
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: MODEL, max_tokens: 1000,
+          system: "Ты строгий руководитель отдела продаж. Честный, конкретный отчёт без воды. ТОЛЬКО JSON без markdown.",
+          messages: [{ role: "user", content: `Отчёт менеджера за ${todayStr()}. Выполнено: ${done.length}/${tasks.length}. Перенесено: ${rescheduled.length}. Не закрыто: ${pending.length}. В очереди: ${backlog.length}. Детали выполненных: ${JSON.stringify(done.map(t => ({ deal: t.dealTitle, action: t.action, comment: t.comment, result: t.resultType })))}. Перенесённые: ${JSON.stringify(rescheduled.map(t => ({ deal: t.dealTitle, comment: t.comment })))}. Верни JSON: {rating,rating_comment,done_summary,risk_comment,reschedule_comment,tomorrow_top3,manager_note}` }],
+          mcp_servers: [BITRIX_MCP]
+        })
+      });
+      const data = await res.json();
+      const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+      const s = text.indexOf("{"), e = text.lastIndexOf("}");
+      if (s >= 0 && e >= 0) setReport(JSON.parse(text.slice(s, e + 1)));
+      else setErr("Не удалось разобрать ответ");
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  };
+
+  const rc = (r) => r >= 8 ? "green" : r >= 5 ? "amber" : "red";
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        {[["Выполнено", done.length, "green"], ["Перенесено", rescheduled.length, "amber"], ["Не закрыто", pending.length, pending.length > 0 ? "coral" : "gray"], ["Очередь", backlog.length, "blue"]].map(([l, v, c]) => (
+          <div key={l} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "8px 12px", flex: 1, minWidth: 70 }}>
+            <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-secondary)" }}>{l}</p>
+            <p style={{ margin: 0, fontSize: 18, fontWeight: 500, color: C[c].text }}>{v}</p>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>
+          <span>Прогресс дня</span><span>{pct}%</span>
+        </div>
+        <div style={{ height: 5, background: "var(--color-background-secondary)", borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ height: "100%", width: `${pct}%`, background: C.green.border, borderRadius: 3 }} />
+        </div>
+      </div>
+
+      {done.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <p style={{ margin: "0 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Выполненные дела</p>
+          {done.map(t => (
+            <div key={t.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+              <span style={{ color: C.green.text, fontSize: 12, flexShrink: 0 }}>✓</span>
+              <div style={{ flex: 1 }}>
+                <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{t.dealTitle}</p>
+                <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{t.comment || "—"}</p>
+              </div>
+              {t.resultType && <Badge color={RESULT_OPTS.find(r => r.id === t.resultType)?.color || "gray"} sm>{RESULT_OPTS.find(r => r.id === t.resultType)?.label}</Badge>}
+            </div>
+          ))}
         </div>
       )}
 
-      {/* Main content */}
-      {hasData&&selectedUser&&(
+      <button onClick={generate} disabled={loading} style={{ fontSize: 12, padding: "7px 16px" }}>
+        {loading ? <Spin label="Анализируем день…" /> : "Отчёт для руководителя ↗"}
+      </button>
+      {err && <p style={{ fontSize: 11, color: C.red.text, marginTop: 6 }}>{err}</p>}
+
+      {report && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px 12px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", marginBottom: 10 }}>
+            <div style={{ width: 42, height: 42, borderRadius: "50%", background: C[rc(report.rating)].bg, color: C[rc(report.rating)].text, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <span style={{ fontSize: 15, fontWeight: 500 }}>{report.rating}</span>
+              <span style={{ fontSize: 8 }}>из 10</span>
+            </div>
+            <div>
+              <p style={{ margin: "0 0 2px", fontSize: 13, fontWeight: 500 }}>{report.rating_comment}</p>
+              <p style={{ margin: 0, fontSize: 12, color: "var(--color-text-secondary)" }}>{report.done_summary}</p>
+            </div>
+          </div>
+          {report.risk_comment && <div style={{ background: C.coral.bg, border: `0.5px solid ${C.coral.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 6 }}><p style={{ margin: 0, fontSize: 12, color: C.coral.text }}>{report.risk_comment}</p></div>}
+          {report.reschedule_comment && <div style={{ background: C.amber.bg, border: `0.5px solid ${C.amber.border}`, borderRadius: "var(--border-radius-md)", padding: "7px 10px", marginBottom: 6 }}><p style={{ margin: 0, fontSize: 12, color: C.amber.text }}>{report.reschedule_comment}</p></div>}
+          {report.tomorrow_top3 && (
+            <div style={{ marginTop: 8 }}>
+              <p style={{ margin: "0 0 5px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Приоритеты завтра</p>
+              {(Array.isArray(report.tomorrow_top3) ? report.tomorrow_top3 : [report.tomorrow_top3]).map((a, i) => (
+                <div key={i} style={{ display: "flex", gap: 7, alignItems: "flex-start", padding: "5px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                  <span style={{ width: 16, height: 16, borderRadius: "50%", background: C.blue.bg, color: C.blue.text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 500, flexShrink: 0, marginTop: 1 }}>{i + 1}</span>
+                  <span style={{ fontSize: 12 }}>{typeof a === "string" ? a : a.action || JSON.stringify(a)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {report.manager_note && <div style={{ marginTop: 8, padding: "7px 10px", border: `0.5px solid ${C.purple.border}`, borderRadius: "var(--border-radius-md)", background: C.purple.bg }}><p style={{ margin: "0 0 2px", fontSize: 9, color: C.purple.text, textTransform: "uppercase", fontWeight: 500 }}>Заметка руководителю</p><p style={{ margin: 0, fontSize: 12, color: C.purple.text }}>{report.manager_note}</p></div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Admin tab ─────────────────────────────────────────────────────────────────
+function AdminTab() {
+  const rules = ["Обязательный комментарий при переносе","Блокировка слотов при встречах","Отчёт руководителю в конце дня","Запрет закрытия без результата"];
+  return (
+    <div>
+      <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 500 }}>Теги организации</p>
+      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 14 }}>
+        {TAG_PRESETS.map(t => <span key={t.id} style={{ background: t.bg, color: t.color, border: `0.5px solid ${t.color}`, borderRadius: 5, padding: "3px 9px", fontSize: 11, fontWeight: 500 }}>{t.label}</span>)}
+      </div>
+      <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 12, marginBottom: 14 }}>
+        <p style={{ margin: "0 0 8px", fontSize: 13, fontWeight: 500 }}>Правила воркспейса</p>
+        {rules.map((r, i) => (
+          <label key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, padding: "5px 0", borderBottom: "0.5px solid var(--color-border-tertiary)", cursor: "pointer" }}>
+            <input type="checkbox" defaultChecked style={{ cursor: "pointer" }} />{r}
+          </label>
+        ))}
+      </div>
+      <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 12 }}>
+        <p style={{ margin: "0 0 8px", fontSize: 13, fontWeight: 500 }}>Сотрудники</p>
+        {["Иванов А. — Розничный отдел", "Петрова М. — Розничный отдел", "Сидоров К. — Оптовый отдел"].map((s, i) => (
+          <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12 }}>
+            <span>{s}</span><Badge color="blue" sm>Менеджер</Badge>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [schedule, setSchedule] = useState(DEMO_SCHEDULE);
+  const [queue, setQueue] = useState(DEMO_QUEUE);
+  const [tab, setTab] = useState("schedule");
+  const [loading, setLoading] = useState(false);
+
+  const done = schedule.filter(t => t.status === "done");
+  const active = schedule.filter(t => t.status !== "done");
+
+  const handleUpdate = useCallback((updated) => setSchedule(ts => ts.map(t => t.id === updated.id ? updated : t)), []);
+
+  const handleComplete = useCallback(async (id, { result, comment }) => {
+    setSchedule(ts => ts.map(t => t.id === id ? { ...t, status: "done", comment, resultType: result } : t));
+    try {
+      await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 100, system: "Bitrix24 MCP. Обнови задачу.", messages: [{ role: "user", content: `Закрой задачу, добавь комментарий: "${comment}", статус 5.` }], mcp_servers: [BITRIX_MCP] }) });
+    } catch (e) { console.warn("Bitrix write-back:", e.message); }
+  }, []);
+
+  const handleReschedule = useCallback(async (id, { date, time, comment }) => {
+    setSchedule(ts => ts.map(t => t.id === id ? { ...t, status: "rescheduled", comment, timeStart: time || t.timeStart } : t));
+    try {
+      await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 100, system: "Bitrix24 MCP. Обнови задачу.", messages: [{ role: "user", content: `Перенеси задачу на ${date} ${time}, добавь комментарий: "${comment}"` }], mcp_servers: [BITRIX_MCP] }) });
+    } catch (e) { console.warn("Bitrix write-back:", e.message); }
+  }, []);
+
+  const loadFromBitrix = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 1000, system: "Bitrix24 MCP. ТОЛЬКО JSON без markdown.", messages: [{ role: "user", content: `Получи задачи пользователя на ${todayStr()} из Bitrix24. Верни JSON: {schedule:[{id,type,timeStart,timeEnd,dealId,dealTitle,action,priority,stage,amount,daysInCycle,lastTouch,contact:{name,phone},files:[{name,type}],tags,status,blocksSlot,comment}], queue:[...]}` }], mcp_servers: [BITRIX_MCP] }) });
+      const data = await res.json();
+      const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+      const s = text.indexOf("{"), e = text.lastIndexOf("}");
+      if (s >= 0 && e >= 0) {
+        const p = JSON.parse(text.slice(s, e + 1));
+        if (Array.isArray(p.schedule)) setSchedule(p.schedule);
+        if (Array.isArray(p.queue)) setQueue(p.queue);
+      }
+    } catch (e) { console.warn("Load error:", e.message); }
+    setLoading(false);
+  }, []);
+
+  const moveToSchedule = (taskId, time) => {
+    const t = queue.find(x => x.id === taskId);
+    if (!t) return;
+    setQueue(q => q.filter(x => x.id !== taskId));
+    setSchedule(s => [...s, { ...t, timeStart: time || "09:00", timeEnd: "10:00" }]);
+  };
+
+  const TABS = [
+    { id: "schedule", label: `Сегодня (${active.length})` },
+    { id: "queue",    label: `Очередь (${queue.length})` },
+    { id: "report",   label: `Отчёт${done.length > 0 ? " ●" : ""}` },
+    { id: "admin",    label: "Настройки" },
+  ];
+
+  return (
+    <div style={{ padding: "0 0 2rem" }}>
+      <h2 className="sr-only">Ежедневный воркспейс менеджера</h2>
+
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+        <div>
+          <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Рабочий день</p>
+          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>{todayStr()}</h2>
+        </div>
+        <button onClick={loadFromBitrix} disabled={loading} style={{ fontSize: 11, padding: "5px 12px", display: "flex", alignItems: "center", gap: 5 }}>
+          {loading ? <Spin label="Загрузка…" /> : "↻ Из Bitrix24"}
+        </button>
+      </div>
+
+      <MiniGrid tasks={schedule} />
+
+      {/* Stats */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        {[["Дел сегодня", schedule.length, "gray"], ["Выполнено", done.length, "green"], ["Встречи", schedule.filter(t => t.blocksSlot).length, "purple"], ["Очередь", queue.length, "blue"]].map(([l, v, c]) => (
+          <div key={l} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "8px 12px", flex: 1, minWidth: 70 }}>
+            <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-secondary)" }}>{l}</p>
+            <p style={{ margin: 0, fontSize: 18, fontWeight: 500, color: C[c].text }}>{v}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: 12 }}>
+        {TABS.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ background: "transparent", border: "none", padding: "6px 12px", fontSize: 12, cursor: "pointer", color: tab === t.id ? "var(--color-text-primary)" : "var(--color-text-secondary)", borderBottom: tab === t.id ? "2px solid var(--color-text-primary)" : "2px solid transparent", fontWeight: tab === t.id ? 500 : 400 }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* Schedule tab */}
+      {tab === "schedule" && (
         <>
-          {/* User bar */}
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16,padding:"10px 14px",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)"}}>
-            <div style={{width:32,height:32,borderRadius:"50%",background:C.purple.bg,color:C.purple.text,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:500,flexShrink:0}}>
-              {selectedUser.name.split(" ").slice(0,2).map(n=>n[0]).join("")}
-            </div>
-            <div style={{flex:1}}>
-              <p style={{margin:0,fontSize:13,fontWeight:500}}>{selectedUser.name}</p>
-              <p style={{margin:0,fontSize:11,color:"var(--color-text-secondary)"}}>{selectedUser.position||"Менеджер"}</p>
-            </div>
-            <span style={{fontSize:11,color:"var(--color-text-tertiary)"}}>{todayStr()}</span>
-          </div>
-
-          {/* Stats */}
-          <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-            <Stat label="Задач сегодня" value={todayTasks.length} color="purple"/>
-            <Stat label="Всего активных" value={tasks.length} color="teal"/>
-            <Stat label="Просроченных" value={overdueTasks.length} color={overdueTasks.length>0?"red":"gray"} note={overdueTasks.length>0?"требует решения":"всё в порядке"}/>
-            <Stat label="Сделок" value={deals.length} color="blue"/>
-          </div>
-
-          {/* Overdue alert */}
-          {overdueTasks.length>0&&(
-            <div style={{background:C.red.bg,border:`0.5px solid ${C.red.border}`,borderRadius:"var(--border-radius-lg)",padding:"12px 14px",marginBottom:16}}>
-              <p style={{margin:"0 0 8px",fontSize:12,fontWeight:500,color:C.red.text}}>⚠ Просроченные задачи — требуют немедленного решения</p>
-              {overdueTasks.map(t=>(
-                <div key={t.id} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"0.5px solid "+C.red.border}}>
-                  <span style={{flex:1,fontSize:12,color:C.red.text}}>{t.title}</span>
-                  {t.deal&&<Badge color="red" sm>{t.deal}</Badge>}
-                  <button onClick={()=>rescheduleOverdue(t.id)} disabled={busy} style={{fontSize:10,padding:"3px 8px"}}>→ Завтра</button>
-                  <button onClick={()=>changeTaskStatus(t.id,5)} disabled={busy||statusChanging===t.id} style={{fontSize:10,padding:"3px 8px"}}>Закрыть</button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <Tab tabs={TABS} active={tab} onChange={setTab}/>
-
-          {/* ── TASKS TAB ── */}
-          {tab==="tasks"&&(
+          {active.map(t => <TaskCard key={t.id} task={t} allTasks={schedule} onUpdate={handleUpdate} onComplete={handleComplete} onReschedule={handleReschedule} />)}
+          {done.length > 0 && (
             <>
-              {todayTasks.length>0&&(
-                <>
-                  <p style={{margin:"0 0 8px",fontSize:11,color:"var(--color-text-secondary)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Сегодня</p>
-                  {todayTasks.map(t=><TaskCard key={t.id} task={t} onStatusChange={changeTaskStatus} onComment={submitComment} statusChanging={statusChanging} busy={busy}/>)}
-                </>
-              )}
-              {futureTasks.length>0&&(
-                <>
-                  <p style={{margin:"16px 0 8px",fontSize:11,color:"var(--color-text-secondary)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Запланировано</p>
-                  {futureTasks.map(t=><TaskCard key={t.id} task={t} onStatusChange={changeTaskStatus} onComment={submitComment} statusChanging={statusChanging} busy={busy}/>)}
-                </>
-              )}
-              {tasks.length===0&&<p style={{fontSize:13,color:"var(--color-text-tertiary)"}}>Нет активных задач на сегодня и будущее</p>}
+              <p style={{ margin: "10px 0 6px", fontSize: 10, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Выполнено ({done.length})</p>
+              {done.map(t => <TaskCard key={t.id} task={t} allTasks={schedule} onUpdate={handleUpdate} onComplete={handleComplete} onReschedule={handleReschedule} />)}
             </>
           )}
-
-          {/* ── DEALS TAB ── */}
-          {tab==="deals"&&(
-            <>
-              {deals.map(deal=>(
-                <div key={deal.id} style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"12px 14px",marginBottom:8}}>
-                  <div style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:6}}>
-                    <div style={{flex:1}}>
-                      <p style={{margin:"0 0 4px",fontSize:13,fontWeight:500}}>{deal.title}</p>
-                      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                        <Badge color={DEAL_STAGE_COLOR[deal.stage_id]||"gray"} sm>{deal.stage_id||"—"}</Badge>
-                        {deal.opportunity&&<Badge color="teal" sm>{Number(deal.opportunity).toLocaleString("ru")} {deal.currency_id||"₽"}</Badge>}
-                        {deal.contact_name&&<Badge color="gray" sm>{deal.contact_name}</Badge>}
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{display:"flex",gap:6,marginTop:8,borderTop:"0.5px solid var(--color-border-tertiary)",paddingTop:8}}>
-                    <span style={{fontSize:11,color:"var(--color-text-tertiary)",flex:1}}>
-                      Задач: {tasks.filter(t=>t.deal&&deal.title?.toLowerCase().includes(t.deal.toLowerCase())).length}
-                    </span>
-                    <button onClick={()=>{setSelectedDealForAI(deal);setTab("ai");generateTasksForDeal(deal);}} style={{fontSize:10,padding:"3px 10px"}}>ИИ-задачи ↗</button>
-                  </div>
-                </div>
-              ))}
-            </>
-          )}
-
-          {/* ── AI TAB ── */}
-          {tab==="ai"&&(
-            <>
-              <div style={{marginBottom:16}}>
-                <p style={{margin:"0 0 8px",fontSize:12,color:"var(--color-text-secondary)"}}>Выберите сделку — ИИ-агент проанализирует её и предложит конкретные задачи</p>
-                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                  {deals.map(d=>(
-                    <button key={d.id} onClick={()=>{setSelectedDealForAI(d);generateTasksForDeal(d);}} disabled={generatingTasks||busy} style={{fontSize:11,padding:"5px 12px",border:selectedDealForAI?.id===d.id?"1.5px solid var(--color-border-info)":"0.5px solid var(--color-border-secondary)"}}>
-                      {d.title?.split("—")[0]?.trim()||d.title}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              {generatingTasks&&<div style={{marginBottom:12}}><Spin label="ИИ-агент анализирует сделку…"/></div>}
-              {aiProposals.length>0&&(
-                <>
-                  <p style={{margin:"0 0 8px",fontSize:11,color:C.purple.text,textTransform:"uppercase",letterSpacing:"0.06em"}}>Предложения ИИ-агента</p>
-                  {aiProposals.map(p=><AITaskProposal key={p._id} proposal={p} onApprove={approveAITask} onReject={rejectAITask} busy={busy}/>)}
-                </>
-              )}
-              {!generatingTasks&&aiProposals.length===0&&selectedDealForAI&&(
-                <p style={{fontSize:13,color:"var(--color-text-tertiary)"}}>Все предложения просмотрены</p>
-              )}
-              {!generatingTasks&&!selectedDealForAI&&(
-                <p style={{fontSize:13,color:"var(--color-text-tertiary)"}}>Выберите сделку выше для генерации задач</p>
-              )}
-            </>
-          )}
-
-          {/* ── REPORT TAB ── */}
-          {tab==="report"&&(
-            <>
-              <div style={{display:"flex",gap:8,marginBottom:16,alignItems:"center"}}>
-                <button onClick={generateReport} disabled={generatingReport||busy} style={{fontSize:12,padding:"7px 16px"}}>
-                  {generatingReport?"Генерация…":"Сформировать отчёт ↗"}
-                </button>
-                <span style={{fontSize:11,color:"var(--color-text-tertiary)"}}>за {todayStr()}</span>
-              </div>
-              {generatingReport&&<Spin label="ИИ анализирует день…"/>}
-              {report&&(
-                <div>
-                  {/* Score */}
-                  <div style={{display:"flex",gap:16,marginBottom:16,alignItems:"center"}}>
-                    <div style={{width:56,height:56,borderRadius:"50%",background:report.score>=7?C.green.bg:report.score>=5?C.amber.bg:C.red.bg,color:report.score>=7?C.green.text:report.score>=5?C.amber.text:C.red.text,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flexShrink:0}}>
-                      <span style={{fontSize:20,fontWeight:500}}>{report.score}</span>
-                      <span style={{fontSize:9}}>из 10</span>
-                    </div>
-                    <div>
-                      <p style={{margin:"0 0 2px",fontSize:13,fontWeight:500}}>{report.score_comment}</p>
-                      <p style={{margin:0,fontSize:12,color:"var(--color-text-secondary)"}}>{report.summary}</p>
-                    </div>
-                  </div>
-
-                  {/* Stats row */}
-                  <div style={{display:"flex",gap:8,marginBottom:16}}>
-                    <Stat label="Выполнено" value={report.done_count} color="green"/>
-                    <Stat label="В работе" value={report.pending_count} color="amber"/>
-                    <Stat label="Просрочено" value={report.overdue_count} color={report.overdue_count>0?"red":"gray"}/>
-                  </div>
-
-                  {/* Risks */}
-                  {report.risks?.length>0&&(
-                    <>
-                      <p style={{margin:"0 0 8px",fontSize:11,color:C.coral.text,textTransform:"uppercase",letterSpacing:"0.06em"}}>Риски</p>
-                      {report.risks.map((r,i)=>(
-                        <div key={i} style={{background:C.coral.bg,border:`0.5px solid ${C.coral.border}`,borderRadius:"var(--border-radius-md)",padding:"8px 12px",marginBottom:6}}>
-                          <p style={{margin:0,fontSize:12,color:C.coral.text}}><strong>{r.deal}:</strong> {r.risk}</p>
-                        </div>
-                      ))}
-                    </>
-                  )}
-
-                  {/* Tomorrow */}
-                  {report.tomorrow?.length>0&&(
-                    <>
-                      <p style={{margin:"12px 0 8px",fontSize:11,color:"var(--color-text-secondary)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Приоритеты завтра</p>
-                      {report.tomorrow.map((a,i)=>(
-                        <div key={i} style={{display:"flex",gap:8,alignItems:"center",padding:"7px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
-                          <span style={{width:18,height:18,borderRadius:"50%",background:C.blue.bg,color:C.blue.text,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:500,flexShrink:0}}>{i+1}</span>
-                          <span style={{fontSize:13}}>{a.action}</span>
-                        </div>
-                      ))}
-                    </>
-                  )}
-
-                  <p style={{margin:"16px 0 0",fontSize:11,color:"var(--color-text-tertiary)"}}>
-                    📎 Для прикрепления скриншотов к задачам используйте нативный Bitrix24 → задача → комментарий → прикрепить файл
-                  </p>
-                </div>
-              )}
-            </>
-          )}
+          {schedule.length === 0 && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Нет дел. Загрузите из Bitrix24 или перенесите из очереди.</p>}
         </>
       )}
+
+      {/* Queue tab */}
+      {tab === "queue" && (
+        <>
+          <p style={{ margin: "0 0 8px", fontSize: 12, color: "var(--color-text-secondary)" }}>Дела без времени — возьмите в работу или запланируйте</p>
+          {queue.map(t => (
+            <div key={t.id} style={{ position: "relative" }}>
+              <TaskCard task={t} allTasks={schedule}
+                onUpdate={u => setQueue(q => q.map(x => x.id === u.id ? u : x))}
+                onComplete={(id, res) => setQueue(q => q.map(x => x.id === id ? { ...x, status: "done", comment: res.comment, resultType: res.result } : x))}
+                onReschedule={(id, res) => moveToSchedule(id, res.time)}
+                isQueue
+              />
+            </div>
+          ))}
+          {queue.length === 0 && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Очередь пуста — все дела распределены по времени</p>}
+        </>
+      )}
+
+      {tab === "report" && <ReportTab tasks={schedule} backlog={queue} />}
+      {tab === "admin" && <AdminTab />}
     </div>
   );
 }
