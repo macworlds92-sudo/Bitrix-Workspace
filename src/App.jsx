@@ -133,7 +133,7 @@ function Spin({ label = "Загрузка…" }) {
 function MiniGrid({ tasks }) {
   return (
     <div style={{ marginBottom: 14 }}>
-      <p style={{ margin: "0 0 5px", fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.07em" }}>Расписание {todayStr()}</p>
+      <p style={{ margin: "0 0 5px", fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.07em" }}>Расписание {todayStr}</p>
       <div style={{ display: "flex", gap: 2 }}>
         {HOURS.map(h => {
           const meeting = tasks.find(t => t.blocksSlot && t.status !== "done" && toMins(t.timeStart) <= h * 60 && toMins(t.timeEnd) > h * 60);
@@ -457,7 +457,7 @@ function ReportTab({ tasks, backlog }) {
         body: JSON.stringify({
           model: MODEL, max_tokens: 1000,
           system: "Ты строгий руководитель отдела продаж. Честный, конкретный отчёт без воды. ТОЛЬКО JSON без markdown.",
-          messages: [{ role: "user", content: `Отчёт менеджера за ${todayStr()}. Выполнено: ${done.length}/${tasks.length}. Перенесено: ${rescheduled.length}. Не закрыто: ${pending.length}. В очереди: ${backlog.length}. Детали выполненных: ${JSON.stringify(done.map(t => ({ deal: t.dealTitle, action: t.action, comment: t.comment, result: t.resultType })))}. Перенесённые: ${JSON.stringify(rescheduled.map(t => ({ deal: t.dealTitle, comment: t.comment })))}. Верни JSON: {rating,rating_comment,done_summary,risk_comment,reschedule_comment,tomorrow_top3,manager_note}` }],
+          messages: [{ role: "user", content: `Отчёт менеджера за ${todayStr}. Выполнено: ${done.length}/${tasks.length}. Перенесено: ${rescheduled.length}. Не закрыто: ${pending.length}. В очереди: ${backlog.length}. Детали выполненных: ${JSON.stringify(done.map(t => ({ deal: t.dealTitle, action: t.action, comment: t.comment, result: t.resultType })))}. Перенесённые: ${JSON.stringify(rescheduled.map(t => ({ deal: t.dealTitle, comment: t.comment })))}. Верни JSON: {rating,rating_comment,done_summary,risk_comment,reschedule_comment,tomorrow_top3,manager_note}` }],
           mcp_servers: [BITRIX_MCP]
         })
       });
@@ -603,7 +603,7 @@ export default function App() {
   const loadFromBitrix = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 1000, system: "Bitrix24 MCP. ТОЛЬКО JSON без markdown.", messages: [{ role: "user", content: `Получи задачи пользователя на ${todayStr()} из Bitrix24. Верни JSON: {schedule:[{id,type,timeStart,timeEnd,dealId,dealTitle,action,priority,stage,amount,daysInCycle,lastTouch,contact:{name,phone},files:[{name,type}],tags,status,blocksSlot,comment}], queue:[...]}` }], mcp_servers: [BITRIX_MCP] }) });
+      const res = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: MODEL, max_tokens: 1000, system: "Bitrix24 MCP. ТОЛЬКО JSON без markdown.", messages: [{ role: "user", content: `Получи задачи пользователя на ${todayStr} из Bitrix24. Верни JSON: {schedule:[{id,type,timeStart,timeEnd,dealId,dealTitle,action,priority,stage,amount,daysInCycle,lastTouch,contact:{name,phone},files:[{name,type}],tags,status,blocksSlot,comment}], queue:[...]}` }], mcp_servers: [BITRIX_MCP] }) });
       const data = await res.json();
       const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
       const s = text.indexOf("{"), e = text.lastIndexOf("}");
@@ -638,7 +638,7 @@ export default function App() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
         <div>
           <p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Рабочий день</p>
-          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>{todayStr()}</h2>
+          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>{todayStr}</h2>
         </div>
         <button onClick={loadFromBitrix} disabled={loading} style={{ fontSize: 11, padding: "5px 12px", display: "flex", alignItems: "center", gap: 5 }}>
           {loading ? <Spin label="Загрузка…" /> : "↻ Из Bitrix24"}
