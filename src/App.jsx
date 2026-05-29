@@ -457,14 +457,12 @@ function ReportTab({ items, queue, userName, kpi, monthPlan }) {
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [manualRole, setManualRole] = useState(null); // override for debug
-
-  // effective role
-  const effectiveRole = manualRole || role;
   const [currentUser, setCurrentUser] = useState(null);
   const [viewUser, setViewUser] = useState(null);
   const [users, setUsers] = useState([]);
   const [role, setRole] = useState("manager");
+  const [manualRole, setManualRole] = useState(null);
+  const effectiveRole = manualRole || role;
   const [storedROPs, setStoredROPs] = useState([]);
   const [deals, setDeals] = useState([]);
   const [stages, setStages] = useState([]);
