@@ -470,6 +470,8 @@ export default function App() {
   const [queue, setQueue] = useState([]);
   const [kpi, setKpi] = useState(null);
   const [kpiLoading, setKpiLoading] = useState(false);
+  const [userSearch, setUserSearch] = useState("");
+  const [newDeals, setNewDeals] = useState([]); // deals with STAGE_ID=NEW
   const [plans, setPlans] = useState({});
   const [loading, setLoading] = useState(false);
   const [loadMsg, setLoadMsg] = useState("");
@@ -565,6 +567,14 @@ export default function App() {
 
   useEffect(() => { if (viewUser) loadData(viewUser.id); }, [viewUser]);
 
+  // Auto-refresh every 15 seconds when not busy
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (viewUser && !loading && !busy) loadData(viewUser.id);
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [viewUser, loading, busy]);
+
   const loadData = useCallback(async userId => {
     setLoading(true); setDeals([]); setItems([]); setQueue([]); setKpi(null);
     try {
@@ -576,54 +586,46 @@ export default function App() {
       setDeals(dealsRaw || []);
 
       setLoadMsg("Загружаем дела…");
-      const [actsRaw, tasksRaw, calRaw] = await Promise.all([
-        // Fix: COMPLETED must be "N" not 0 in Bitrix24 REST API
+      const [actsRaw, tasksRaw] = await Promise.all([
         bx24("crm.activity.list", {
           filter: { RESPONSIBLE_ID: String(userId), COMPLETED: "N" },
           select: ["ID","SUBJECT","DEADLINE","TYPE_ID","DESCRIPTION","PRIORITY","ASSOCIATED_ENTITY_ID","ASSOCIATED_ENTITY_TYPE"]
         }).catch(() => []),
         bx24("tasks.task.list", {
-          filter: { RESPONSIBLE_ID: String(userId), "!STATUS": 5 },
+          filter: { RESPONSIBLE_ID: String(userId), "!STATUS": [3,5,6] },
           select: ["ID","TITLE","DEADLINE","PRIORITY","UF_CRM_TASK","DESCRIPTION"]
         }).catch(() => ({ tasks: [] })),
-        // Load calendar events for today
-        bx24("calendar.event.getNearest", { type: "user", ownerId: String(userId) }).catch(() => []),
       ]);
 
-      const normalize = (arr, source) => arr.map(a => ({
+      const normalize = (arr, source) => (arr||[]).map(a => ({
         id: (source === "activity" ? "a_" : "t_") + (a.ID || a.id),
         rawId: a.ID || a.id,
         source,
         title: a.SUBJECT || a.TITLE || "Без названия",
         status: "pending", priority: Number(a.PRIORITY || 0) > 1 ? "high" : "medium",
         deadline: fmt(a.DEADLINE || a.deadline),
-        dealId: source === "activity" ? (a.ASSOCIATED_ENTITY_TYPE === "2" ? a.ASSOCIATED_ENTITY_ID : null) : ((a.UF_CRM_TASK || [])[0] || "").replace(/^D_/, "") || null,
+        dealId: source === "activity"
+          ? (a.ASSOCIATED_ENTITY_TYPE === "2" ? a.ASSOCIATED_ENTITY_ID : null)
+          : ((a.UF_CRM_TASK || [])[0] || "").replace(/^D_/, "") || null,
         typeId: Number(a.TYPE_ID) || (source === "task" ? 3 : 6),
         description: a.DESCRIPTION || "", tags: [], comment: "",
       }));
 
-      // Normalize calendar events (show only today's)
-      const calEvents = (Array.isArray(calRaw) ? calRaw : [])
-        .filter(e => fmt(e.DATE_FROM) === todayStr)
-        .map(e => ({
-          id: "cal_" + e.ID,
-          rawId: e.ID,
-          source: "calendar",
-          title: e.NAME || "Событие",
-          status: "pending",
-          priority: "medium",
-          deadline: todayStr,
-          timeStart: e.DATE_FROM ? new Date(e.DATE_FROM).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : null,
-          dealId: null, typeId: 4, description: e.DESCRIPTION || "", tags: [], comment: "",
-        }));
-
       const all = [
-        ...normalize(actsRaw || [], "activity"),
-        ...normalize(((tasksRaw || {}).tasks || tasksRaw || []), "task"),
-        ...calEvents,
+        ...normalize(Array.isArray(actsRaw) ? actsRaw : [], "activity"),
+        ...normalize(((tasksRaw||{}).tasks || (Array.isArray(tasksRaw) ? tasksRaw : [])), "task"),
       ];
-      setItems(all.filter(a => isToday(a.deadline) || isOver(a.deadline)));
-      setQueue(all.filter(a => isFut(a.deadline)));
+
+      // Only today and future — NO overdue
+      const todayAndFuture = all.filter(a => !isOver(a.deadline));
+      setItems(todayAndFuture.filter(a => isToday(a.deadline)));
+      setQueue(todayAndFuture.filter(a => isFut(a.deadline)));
+      // Load new deals (STAGE_ID = NEW) — shown separately at top
+      const newDealsRaw = await bx24("crm.deal.list", {
+        filter: { ASSIGNED_BY_ID: String(userId), STAGE_ID: "NEW" },
+        select: ["ID","TITLE","DATE_CREATE","OPPORTUNITY","CURRENCY_ID"]
+      }).catch(() => []);
+      setNewDeals(newDealsRaw || []);
 
     } catch (e) { addErr(e.message); }
     setLoading(false); setLoadMsg("");
@@ -769,9 +771,25 @@ export default function App() {
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           {canViewOthers(effectiveRole) && (
             users.length > 1 ? (
-              <select onChange={e => { const u = users.find(x => String(x.id) === e.target.value); if (u) setViewUser(u); }} value={String(viewUser?.id || "")} style={{ fontSize: 12, padding: "5px 10px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)" }}>
-                {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
-              </select>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", position: "relative" }}>
+                <input
+                  type="text"
+                  value={userSearch}
+                  onChange={e => setUserSearch(e.target.value)}
+                  placeholder="Поиск сотрудника…"
+                  style={{ fontSize: 12, padding: "5px 10px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", width: 160 }}
+                />
+                {userSearch && (
+                  <div style={{ position: "absolute", top: "100%", right: 0, zIndex: 200, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", boxShadow: "0 4px 12px rgba(0,0,0,0.1)", minWidth: 200, maxHeight: 200, overflowY: "auto" }}>
+                    {users.filter(u => u.name.toLowerCase().includes(userSearch.toLowerCase())).map(u => (
+                      <div key={u.id} onClick={() => { setViewUser(u); setUserSearch(""); }} style={{ padding: "8px 12px", fontSize: 12, cursor: "pointer", borderBottom: "0.5px solid var(--color-border-tertiary)", display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ width: 22, height: 22, borderRadius: "50%", background: C.purple.bg, color: C.purple.text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 500, flexShrink: 0 }}>{u.name.split(" ").slice(0,2).map(n=>n[0]).join("")}</div>
+                        <div><p style={{ margin: 0, fontSize: 12 }}>{u.name}</p><p style={{ margin: 0, fontSize: 10, color: "var(--color-text-tertiary)" }}>{u.position}</p></div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             ) : (
               <button onClick={async () => {
                 try {
@@ -783,7 +801,9 @@ export default function App() {
               </button>
             )
           )}
-          <button onClick={() => viewUser && loadData(viewUser.id)} disabled={loading} style={{ fontSize: 11, padding: "5px 12px" }}>↻</button>
+          <button onClick={() => viewUser && loadData(viewUser.id)} disabled={loading} style={{ fontSize: 11, padding: "5px 12px" }} title="Обновить (авто каждые 15с)">
+            {loading ? <Spin label="" /> : "↻"}
+          </button>
         </div>
       </div>
 
@@ -823,6 +843,21 @@ export default function App() {
 
       {/* Plan bar */}
       {monthPlan > 0 && (kpi || kpiLoading) && <PlanBar wonAmount={kpi?.wonAmount || 0} monthPlan={monthPlan} />}
+
+      {/* New deals notification */}
+      {newDeals.length > 0 && (
+        <div style={{ background: C.blue.bg, border: `0.5px solid ${C.blue.border}`, borderRadius: "var(--border-radius-lg)", padding: "10px 14px", marginBottom: 12 }}>
+          <p style={{ margin: "0 0 6px", fontSize: 12, fontWeight: 500, color: C.blue.text }}>🆕 Новые заявки ({newDeals.length}) — требуют первого касания</p>
+          {newDeals.slice(0, 5).map(d => (
+            <div key={d.ID} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: `0.5px solid ${C.blue.border}` }}>
+              <span style={{ flex: 1, fontSize: 12, color: C.blue.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.TITLE}</span>
+              {d.OPPORTUNITY > 0 && <span style={{ fontSize: 11, color: C.blue.text, flexShrink: 0 }}>{Number(d.OPPORTUNITY).toLocaleString("ru")} ₽</span>}
+              <span style={{ fontSize: 10, color: C.blue.text, opacity: 0.7, flexShrink: 0 }}>{fmt(d.DATE_CREATE)}</span>
+            </div>
+          ))}
+          {newDeals.length > 5 && <p style={{ margin: "4px 0 0", fontSize: 11, color: C.blue.text, opacity: 0.7 }}>…и ещё {newDeals.length - 5}</p>}
+        </div>
+      )}
 
       {/* Stats */}
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
