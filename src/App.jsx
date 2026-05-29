@@ -39,12 +39,16 @@ const PLAN_OPTION_KEY = `sales_plans_${YEAR}`;
 // ── Role system ───────────────────────────────────────────────────────────────
 const getRole = (user, storedROPs = []) => {
   if (!user) return "manager";
+  // Handle all Bitrix24 IS_ADMIN variants: "Y", true, 1, "1", "true"
   if (user.isAdmin) return "admin";
   if (storedROPs.includes(String(user.id))) return "rop";
   const pos = (user.position || "").toLowerCase();
-  if (pos.includes("роп") || pos.includes("руководитель отдела") || pos.includes("rop") || pos.includes("sales manager head")) return "rop";
+  if (pos.includes("роп") || pos.includes("руководитель отдела") || pos.includes("rop") || pos.includes("head of sales")) return "rop";
   return "manager";
 };
+
+// Parse IS_ADMIN from Bitrix24 - handles "Y", true, 1, "1"
+const parseIsAdmin = (val) => val === "Y" || val === true || val === 1 || val === "1" || val === "true";
 const canViewOthers = role => role === "admin" || role === "rop";
 const canManagePlan = role => role === "admin" || role === "rop";
 const canReassign = role => role === "admin" || role === "rop";
@@ -251,7 +255,7 @@ function DealBlock({ deal, stages, users, role, onStageChange, onReassign, busy 
           <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>Ответственный</p>
           <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{responsible?.name || deal.ASSIGNED_BY_ID || "—"}</p>
         </div>
-        {canReassign(role) && users.length > 1 && (
+        {canReassign(effectiveRole) && users.length > 1 && (
           <ReassignButton users={users} currentId={deal.ASSIGNED_BY_ID} onReassign={u => onReassign(deal.ID, u)} busy={busy} />
         )}
       </div>
@@ -351,7 +355,7 @@ function DealCard({ item, deals, stages, users, role, onQuickResult, onComplete,
             <p style={{ margin: "0 0 2px", fontSize: 9, color: "var(--color-text-tertiary)", textTransform: "uppercase" }}>Описание</p>
             <p style={{ margin: 0, fontSize: 12 }}>{item.description}</p>
           </div>}
-          <DealBlock deal={deal} stages={stages} users={users} role={role} onStageChange={onStageChange} onReassign={onReassign} busy={busy} />
+          <DealBlock deal={deal} stages={stages} users={users} role={effectiveRole} onStageChange={onStageChange} onReassign={onReassign} busy={busy} />
           {!done && mode === null && (
             <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8, alignItems: "center" }}>
               <button onClick={() => setMode("complete")} style={{ fontSize: 11, padding: "4px 11px" }}>✓ Результат</button>
@@ -453,7 +457,10 @@ function ReportTab({ items, queue, userName, kpi, monthPlan }) {
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [initErr, setInitErr] = useState("");
+  const [manualRole, setManualRole] = useState(null); // override for debug
+
+  // effective role
+  const effectiveRole = manualRole || role;
   const [currentUser, setCurrentUser] = useState(null);
   const [viewUser, setViewUser] = useState(null);
   const [users, setUsers] = useState([]);
@@ -472,6 +479,8 @@ export default function App() {
   const [tab, setTab] = useState("today");
   const [busy, setBusy] = useState(false);
   const [statusChanging, setStatusChanging] = useState(null);
+
+  const [initErr, setInitErr] = useState("");
 
   const addErr = msg => setErrors(e => [...e.slice(-2), msg]);
 
@@ -499,27 +508,47 @@ export default function App() {
       if (!window.BX24) { setInitErr("BX24 SDK не загружен — откройте из Bitrix24"); return; }
       window.BX24.init(async () => {
         setLoading(true); setLoadMsg("Инициализация…");
+
+        // Step 1: get current user (critical)
+        let u = null;
         try {
-          const [user, stagesRaw, optRaw] = await Promise.all([
-            bx24("user.current"),
-            bx24("crm.dealcategory.stage.list", { id: 0 }).catch(() => []),
-            bx24("app.option.get", { keys: [PLAN_OPTION_KEY, "stored_rops"] }).catch(() => ({})),
-          ]);
+          const user = await bx24("user.current");
+          u = {
+            id: user.ID,
+            name: `${user.NAME || ""} ${user.LAST_NAME || ""}`.trim(),
+            position: user.WORK_POSITION || "Менеджер",
+            isAdmin: parseIsAdmin(user.IS_ADMIN),
+          };
+          setCurrentUser(u); setViewUser(u);
+        } catch (e) { setInitErr("Не удалось определить пользователя: " + e.message); setLoading(false); return; }
 
-          const u = { id: user.ID, name: `${user.NAME} ${user.LAST_NAME}`.trim(), position: user.WORK_POSITION || "Менеджер", isAdmin: user.IS_ADMIN === "Y" };
-          const rops = optRaw?.stored_rops ? JSON.parse(optRaw.stored_rops) : [];
-          const userRole = getRole(u, rops);
-          const plansData = optRaw?.[PLAN_OPTION_KEY] ? JSON.parse(optRaw[PLAN_OPTION_KEY]) : {};
+        // Step 2: load ROPs and plans (non-critical)
+        let rops = [], plansData = {};
+        try {
+          const optRaw = await bx24("app.option.get", { keys: [PLAN_OPTION_KEY, "stored_rops"] });
+          rops = optRaw?.stored_rops ? JSON.parse(optRaw.stored_rops) : [];
+          plansData = optRaw?.[PLAN_OPTION_KEY] ? JSON.parse(optRaw[PLAN_OPTION_KEY]) : {};
+        } catch { /* options not critical */ }
+        setStoredROPs(rops); setPlans(plansData);
 
-          setCurrentUser(u); setViewUser(u); setRole(userRole);
-          setStoredROPs(rops); setStages(stagesRaw || []);
-          setPlans(plansData);
+        // Step 3: determine role
+        const userRole = getRole(u, rops);
+        setRole(userRole);
 
-          if (canViewOthers(userRole)) {
-            const all = await bx24("user.get", { filter: { ACTIVE: true }, select: ["ID","NAME","LAST_NAME","WORK_POSITION"] }).catch(() => []);
+        // Step 4: load stages (non-critical)
+        try {
+          const stagesRaw = await bx24("crm.dealcategory.stage.list", { id: 0 });
+          setStages(stagesRaw || []);
+        } catch { /* stages not critical */ }
+
+        // Step 5: load all users if admin/rop
+        if (canViewOthers(userRole)) {
+          try {
+            const all = await bx24("user.get", { filter: { ACTIVE: true }, select: ["ID","NAME","LAST_NAME","WORK_POSITION"] });
             setUsers((all || []).map(x => ({ id: x.ID, name: `${x.NAME} ${x.LAST_NAME}`.trim(), position: x.WORK_POSITION || "Менеджер" })));
-          }
-        } catch (e) { addErr(e.message); }
+          } catch { /* users not critical */ }
+        }
+
         setLoading(false); setLoadMsg("");
       });
     };
@@ -690,8 +719,8 @@ export default function App() {
     { id: "today", label: `Сегодня (${todayItems.length})` },
     { id: "queue", label: `Очередь (${queue.length})` },
     { id: "report", label: `Отчёт${doneItems.length > 0 ? " ●" : ""}` },
-    ...(canManagePlan(role) ? [{ id: "plan", label: "План" }] : []),
-    ...(canManageSettings(role) ? [{ id: "settings", label: "Настройки" }] : []),
+    ...(canManagePlan(effectiveRole) ? [{ id: "plan", label: "План" }] : []),
+    ...(canManageSettings(effectiveRole) ? [{ id: "settings", label: "Настройки" }] : []),
   ];
 
   return (
@@ -703,7 +732,7 @@ export default function App() {
           <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>{todayStr}</h2>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          {canViewOthers(role) && (
+          {canViewOthers(effectiveRole) && (
             users.length > 1 ? (
               <select onChange={e => { const u = users.find(x => String(x.id) === e.target.value); if (u) setViewUser(u); }} value={String(viewUser?.id || "")} style={{ fontSize: 12, padding: "5px 10px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)" }}>
                 {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
@@ -729,15 +758,23 @@ export default function App() {
       {/* User bar */}
       {viewUser && (
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)" }}>
-          <div style={{ width: 30, height: 30, borderRadius: "50%", background: C[ROLE_COLORS[role] || "gray"].bg, color: C[ROLE_COLORS[role] || "gray"].text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 500, flexShrink: 0 }}>
+          <div style={{ width: 30, height: 30, borderRadius: "50%", background: C[ROLE_COLORS[effectiveRole] || "gray"].bg, color: C[ROLE_COLORS[effectiveRole] || "gray"].text, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 500, flexShrink: 0 }}>
             {viewUser.name.split(" ").slice(0, 2).map(n => n[0]).join("")}
           </div>
           <div style={{ flex: 1 }}>
             <p style={{ margin: 0, fontSize: 13, fontWeight: 500 }}>{viewUser.name}</p>
             <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>{viewUser.position}</p>
           </div>
-          <Badge color={ROLE_COLORS[role] || "gray"} sm>{ROLE_LABELS[role]}</Badge>
-          {canViewOthers(role) && currentUser?.id !== viewUser?.id && <Badge color="amber" sm>просмотр</Badge>}
+          <Badge color={ROLE_COLORS[effectiveRole] || "gray"} sm>{ROLE_LABELS[effectiveRole]}</Badge>
+          {canViewOthers(effectiveRole) && currentUser?.id !== viewUser?.id && <Badge color="amber" sm>просмотр</Badge>}
+          {/* Role override — show if detected as manager but user suspects they're admin */}
+          {effectiveRole === "manager" && (
+            <div style={{ position: "relative" }}>
+              <button onClick={() => setManualRole(manualRole ? null : "admin")} style={{ fontSize: 9, padding: "2px 7px", opacity: 0.5 }} title="Переключить роль вручную">
+                {manualRole ? "× сброс" : "⚙ роль?"}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -789,7 +826,7 @@ export default function App() {
 
       {tab === "report" && <ReportTab items={items} queue={queue} userName={viewUser?.name || ""} kpi={kpi} monthPlan={monthPlan} />}
 
-      {tab === "plan" && canManagePlan(role) && (
+      {tab === "plan" && canManagePlan(effectiveRole) && (
         <PlanManager
           users={users.length > 0 ? users : (currentUser ? [currentUser] : [])}
           plans={plans}
@@ -800,7 +837,7 @@ export default function App() {
         />
       )}
 
-      {tab === "settings" && canManageSettings(role) && (
+      {tab === "settings" && canManageSettings(effectiveRole) && (
         <div>
           <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 500 }}>Теги</p>
           <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 16 }}>
