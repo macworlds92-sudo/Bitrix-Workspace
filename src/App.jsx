@@ -464,6 +464,7 @@ export default function App() {
   const [items, setItems] = useState([]);
   const [queue, setQueue] = useState([]);
   const [kpi, setKpi] = useState(null);
+  const [kpiLoading, setKpiLoading] = useState(false);
   const [plans, setPlans] = useState({});
   const [loading, setLoading] = useState(false);
   const [loadMsg, setLoadMsg] = useState("");
@@ -561,17 +562,33 @@ export default function App() {
       setItems(all.filter(a => isToday(a.deadline) || isOver(a.deadline)));
       setQueue(all.filter(a => isFut(a.deadline)));
 
-      setLoadMsg("Считаем KPI…");
+    } catch (e) { addErr(e.message); }
+    setLoading(false); setLoadMsg("");
+    // Load KPI separately, non-blocking
+    loadKPI(userId);
+  }, []);
+
+  // KPI loads independently with 15s timeout
+  const loadKPI = useCallback(async userId => {
+    setKpiLoading(true);
+    const timeout = ms => new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms));
+    try {
       const ms = monthStart();
-      const [won, allDeals] = await Promise.all([
-        bx24("crm.deal.list", { filter: { ASSIGNED_BY_ID: userId, STAGE_ID: "WON", ">DATE_CLOSED": ms }, select: ["ID","OPPORTUNITY","DATE_CREATE","DATE_CLOSED"] }).catch(() => []),
-        bx24("crm.deal.list", { filter: { ASSIGNED_BY_ID: userId, ">DATE_CREATE": ms }, select: ["ID"] }).catch(() => []),
+      const [won, allDeals] = await Promise.race([
+        Promise.all([
+          bx24("crm.deal.list", { filter: { ASSIGNED_BY_ID: userId, STAGE_ID: "WON", ">DATE_CLOSED": ms }, select: ["ID","OPPORTUNITY","DATE_CREATE","DATE_CLOSED"] }).catch(() => []),
+          bx24("crm.deal.list", { filter: { ASSIGNED_BY_ID: userId, ">DATE_CREATE": ms }, select: ["ID"] }).catch(() => []),
+        ]),
+        timeout(15000).then(() => { throw new Error("KPI timeout"); })
       ]);
       const wonAmt = (won || []).reduce((s, d) => s + Number(d.OPPORTUNITY || 0), 0);
       const avgCycle = won?.length > 0 ? Math.round(won.reduce((s, d) => s + Math.round((new Date(d.DATE_CLOSED) - new Date(d.DATE_CREATE)) / 86400000), 0) / won.length) : 0;
       setKpi({ wonDeals: won?.length || 0, wonAmount: wonAmt, totalDeals: allDeals?.length || 0, pct: allDeals?.length > 0 ? Math.round((won?.length || 0) / allDeals.length * 100) : 0, avgCycle });
-    } catch (e) { addErr(e.message); }
-    setLoading(false); setLoadMsg("");
+    } catch (e) {
+      // KPI failed silently — don't block the UI
+      setKpi({ wonDeals: 0, wonAmount: 0, totalDeals: 0, pct: 0, avgCycle: 0 });
+    }
+    setKpiLoading(false);
   }, []);
 
   // ── Save plans ─────────────────────────────────────────────────────────────
@@ -686,10 +703,21 @@ export default function App() {
           <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>{todayStr}</h2>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          {canViewOthers(role) && users.length > 1 && (
-            <select onChange={e => { const u = users.find(x => String(x.id) === e.target.value); if (u) setViewUser(u); }} value={String(viewUser?.id || "")} style={{ fontSize: 12, padding: "5px 10px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)" }}>
-              {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
-            </select>
+          {canViewOthers(role) && (
+            users.length > 1 ? (
+              <select onChange={e => { const u = users.find(x => String(x.id) === e.target.value); if (u) setViewUser(u); }} value={String(viewUser?.id || "")} style={{ fontSize: 12, padding: "5px 10px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)" }}>
+                {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+              </select>
+            ) : (
+              <button onClick={async () => {
+                try {
+                  const all = await bx24("user.get", { filter: { ACTIVE: true }, select: ["ID","NAME","LAST_NAME","WORK_POSITION"] });
+                  setUsers((all || []).map(x => ({ id: x.ID, name: `${x.NAME} ${x.LAST_NAME}`.trim(), position: x.WORK_POSITION || "Менеджер" })));
+                } catch(e) { addErr(e.message); }
+              }} style={{ fontSize: 11, padding: "5px 12px" }}>
+                👥 Сотрудники
+              </button>
+            )
           )}
           <button onClick={() => viewUser && loadData(viewUser.id)} disabled={loading} style={{ fontSize: 11, padding: "5px 12px" }}>↻</button>
         </div>
@@ -714,14 +742,14 @@ export default function App() {
       )}
 
       {/* Plan bar */}
-      {monthPlan > 0 && kpi && <PlanBar wonAmount={kpi.wonAmount} monthPlan={monthPlan} />}
+      {monthPlan > 0 && (kpi || kpiLoading) && <PlanBar wonAmount={kpi?.wonAmount || 0} monthPlan={monthPlan} />}
 
       {/* Stats */}
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         <Stat label="Дел сегодня" value={todayItems.length} color="blue" />
         <Stat label="Выполнено" value={doneItems.length} color="green" />
         <Stat label="Просрочено" value={overdueItems.length} color={overdueItems.length > 0 ? "red" : "gray"} />
-        {kpi && <Stat label="Конверсия" value={(kpi.pct || 0) + "%"} color={kpi.pct >= 30 ? "green" : kpi.pct >= 15 ? "amber" : "red"} note="этот месяц" />}
+        {kpiLoading ? <div style={{flex:1,minWidth:80,background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",padding:"10px 14px"}}><p style={{margin:0,fontSize:10,color:"var(--color-text-secondary)"}}>Конверсия</p><Spin label=""/></div> : kpi && <Stat label="Конверсия" value={(kpi.pct || 0) + "%"} color={kpi.pct >= 30 ? "green" : kpi.pct >= 15 ? "amber" : "red"} note="этот месяц" />}
       </div>
 
       {/* Overdue */}
