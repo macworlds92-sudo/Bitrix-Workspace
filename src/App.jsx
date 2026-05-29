@@ -520,18 +520,26 @@ export default function App() {
           setCurrentUser(u); setViewUser(u);
         } catch (e) { setInitErr("Не удалось определить пользователя: " + e.message); setLoading(false); return; }
 
-        // Step 2: load ROPs and plans (non-critical)
-        let rops = [], plansData = {};
+        // Step 2: load ROPs, plans, and saved role override (non-critical)
+        let rops = [], plansData = {}, savedRole = null;
         try {
           const optRaw = await bx24("app.option.get", { keys: [PLAN_OPTION_KEY, "stored_rops"] });
           rops = optRaw?.stored_rops ? JSON.parse(optRaw.stored_rops) : [];
           plansData = optRaw?.[PLAN_OPTION_KEY] ? JSON.parse(optRaw[PLAN_OPTION_KEY]) : {};
         } catch { /* options not critical */ }
+
+        // Load user's personal role override from B24
+        try {
+          const userOpts = await bx24("user.option.get", { keys: ["workspace_role"] });
+          savedRole = userOpts?.workspace_role || null;
+        } catch { /* not critical */ }
         setStoredROPs(rops); setPlans(plansData);
 
         // Step 3: determine role
         const userRole = getRole(u, rops);
         setRole(userRole);
+        // Apply saved manual override (persists across sessions)
+        if (savedRole && savedRole !== userRole) setManualRole(savedRole);
 
         // Step 4: load stages (non-critical)
         try {
@@ -568,9 +576,18 @@ export default function App() {
       setDeals(dealsRaw || []);
 
       setLoadMsg("Загружаем дела…");
-      const [actsRaw, tasksRaw] = await Promise.all([
-        bx24("crm.activity.list", { filter: { RESPONSIBLE_ID: userId, COMPLETED: 0 }, select: ["ID","SUBJECT","DEADLINE","TYPE_ID","DESCRIPTION","PRIORITY","ASSOCIATED_ENTITY_ID","ASSOCIATED_ENTITY_TYPE"] }).catch(() => []),
-        bx24("tasks.task.list", { filter: { RESPONSIBLE_ID: userId, "!STATUS": 5 }, select: ["ID","TITLE","DEADLINE","PRIORITY","UF_CRM_TASK","DESCRIPTION"] }).catch(() => ({ tasks: [] })),
+      const [actsRaw, tasksRaw, calRaw] = await Promise.all([
+        // Fix: COMPLETED must be "N" not 0 in Bitrix24 REST API
+        bx24("crm.activity.list", {
+          filter: { RESPONSIBLE_ID: String(userId), COMPLETED: "N" },
+          select: ["ID","SUBJECT","DEADLINE","TYPE_ID","DESCRIPTION","PRIORITY","ASSOCIATED_ENTITY_ID","ASSOCIATED_ENTITY_TYPE"]
+        }).catch(() => []),
+        bx24("tasks.task.list", {
+          filter: { RESPONSIBLE_ID: String(userId), "!STATUS": 5 },
+          select: ["ID","TITLE","DEADLINE","PRIORITY","UF_CRM_TASK","DESCRIPTION"]
+        }).catch(() => ({ tasks: [] })),
+        // Load calendar events for today
+        bx24("calendar.event.getNearest", { type: "user", ownerId: String(userId) }).catch(() => []),
       ]);
 
       const normalize = (arr, source) => arr.map(a => ({
@@ -585,7 +602,26 @@ export default function App() {
         description: a.DESCRIPTION || "", tags: [], comment: "",
       }));
 
-      const all = [...normalize(actsRaw || [], "activity"), ...normalize(((tasksRaw || {}).tasks || tasksRaw || []), "task")];
+      // Normalize calendar events (show only today's)
+      const calEvents = (Array.isArray(calRaw) ? calRaw : [])
+        .filter(e => fmt(e.DATE_FROM) === todayStr)
+        .map(e => ({
+          id: "cal_" + e.ID,
+          rawId: e.ID,
+          source: "calendar",
+          title: e.NAME || "Событие",
+          status: "pending",
+          priority: "medium",
+          deadline: todayStr,
+          timeStart: e.DATE_FROM ? new Date(e.DATE_FROM).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : null,
+          dealId: null, typeId: 4, description: e.DESCRIPTION || "", tags: [], comment: "",
+        }));
+
+      const all = [
+        ...normalize(actsRaw || [], "activity"),
+        ...normalize(((tasksRaw || {}).tasks || tasksRaw || []), "task"),
+        ...calEvents,
+      ];
       setItems(all.filter(a => isToday(a.deadline) || isOver(a.deadline)));
       setQueue(all.filter(a => isFut(a.deadline)));
 
@@ -643,8 +679,9 @@ export default function App() {
     const txt = `[${String(label)}] Быстрое закрытие`;
     setItems(ts => ts.filter(t => t.id !== itemId));
     try {
-      if (source === "activity") await bx24("crm.activity.update", { id: itemId.replace("a_", ""), fields: { COMPLETED: 1 } });
-      else await bx24("tasks.task.update", { taskId: itemId.replace("t_", ""), fields: { STATUS: 5 } });
+      if (source === "activity") await bx24("crm.activity.update", { id: itemId.replace("a_", ""), fields: { COMPLETED: "Y" } });
+      else if (source === "task") await bx24("tasks.task.update", { taskId: itemId.replace("t_", ""), fields: { STATUS: 5 } });
+      // calendar events — just remove from local state, no B24 update needed
       await addComment(dealId, txt); await appendChecklist(dealId, txt);
     } catch (e) { addErr(e.message); }
     setStatusChanging(null);
@@ -656,8 +693,8 @@ export default function App() {
     const txt = `[${String(label)}] ${String(comment)}`;
     setItems(ts => ts.map(t => t.id === itemId ? { ...t, status: "done", comment: String(comment), resultType: result } : t));
     try {
-      if (source === "activity") await bx24("crm.activity.update", { id: itemId.replace("a_", ""), fields: { COMPLETED: 1 } });
-      else await bx24("tasks.task.update", { taskId: itemId.replace("t_", ""), fields: { STATUS: 5 } });
+      if (source === "activity") await bx24("crm.activity.update", { id: itemId.replace("a_", ""), fields: { COMPLETED: "Y" } });
+      else if (source === "task") await bx24("tasks.task.update", { taskId: itemId.replace("t_", ""), fields: { STATUS: 5 } });
       await addComment(dealId, txt); await appendChecklist(dealId, txt);
     } catch (e) { addErr(e.message); }
     setBusy(false);
@@ -670,7 +707,7 @@ export default function App() {
     setItems(ts => ts.map(t => t.id === itemId ? { ...t, status: "rescheduled", comment: String(comment), deadline: fmt(iso) } : t));
     try {
       if (source === "activity") await bx24("crm.activity.update", { id: itemId.replace("a_", ""), fields: { DEADLINE: iso } });
-      else await bx24("tasks.task.update", { taskId: itemId.replace("t_", ""), fields: { DEADLINE: iso } });
+      else if (source === "task") await bx24("tasks.task.update", { taskId: itemId.replace("t_", ""), fields: { DEADLINE: iso } });
       await addComment(dealId, txt); await appendChecklist(dealId, txt);
     } catch (e) { addErr(e.message); }
     setBusy(false);
@@ -765,13 +802,21 @@ export default function App() {
           </div>
           <Badge color={ROLE_COLORS[effectiveRole] || "gray"} sm>{ROLE_LABELS[effectiveRole]}</Badge>
           {canViewOthers(effectiveRole) && currentUser?.id !== viewUser?.id && <Badge color="amber" sm>просмотр</Badge>}
-          {/* Role override — show if detected as manager but user suspects they're admin */}
+          {/* Role override — appears when detected as manager */}
           {effectiveRole === "manager" && (
-            <div style={{ position: "relative" }}>
-              <button onClick={() => setManualRole(manualRole ? null : "admin")} style={{ fontSize: 9, padding: "2px 7px", opacity: 0.5 }} title="Переключить роль вручную">
-                {manualRole ? "× сброс" : "⚙ роль?"}
-              </button>
-            </div>
+            <button
+              onClick={async () => {
+                const newRole = manualRole ? null : "admin";
+                setManualRole(newRole);
+                try {
+                  await bx24("user.option.set", { options: { workspace_role: newRole || "" } });
+                } catch { /* save best effort */ }
+              }}
+              style={{ fontSize: 9, padding: "2px 7px", opacity: 0.6, border: "0.5px solid var(--color-border-tertiary)", borderRadius: 4, cursor: "pointer", background: "transparent" }}
+              title="Я администратор — сохранить роль"
+            >
+              {manualRole ? "× сброс роли" : "⚙ Я администратор"}
+            </button>
           )}
         </div>
       )}
