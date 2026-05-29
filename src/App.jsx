@@ -255,7 +255,7 @@ function DealBlock({ deal, stages, users, role, onStageChange, onReassign, busy 
           <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)" }}>Ответственный</p>
           <p style={{ margin: 0, fontSize: 12, fontWeight: 500 }}>{responsible?.name || deal.ASSIGNED_BY_ID || "—"}</p>
         </div>
-        {canReassign(effectiveRole) && users.length > 1 && (
+        {canReassign(role) && users.length > 1 && (
           <ReassignButton users={users} currentId={deal.ASSIGNED_BY_ID} onReassign={u => onReassign(deal.ID, u)} busy={busy} />
         )}
       </div>
@@ -355,7 +355,7 @@ function DealCard({ item, deals, stages, users, role, onQuickResult, onComplete,
             <p style={{ margin: "0 0 2px", fontSize: 9, color: "var(--color-text-tertiary)", textTransform: "uppercase" }}>Описание</p>
             <p style={{ margin: 0, fontSize: 12 }}>{item.description}</p>
           </div>}
-          <DealBlock deal={deal} stages={stages} users={users} role={effectiveRole} onStageChange={onStageChange} onReassign={onReassign} busy={busy} />
+          <DealBlock deal={deal} stages={stages} users={users} role={role} onStageChange={onStageChange} onReassign={onReassign} busy={busy} />
           {!done && mode === null && (
             <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8, alignItems: "center" }}>
               <button onClick={() => setMode("complete")} style={{ fontSize: 11, padding: "4px 11px" }}>✓ Результат</button>
